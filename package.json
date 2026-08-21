@@ -1,0 +1,16 @@
+{
+  "name": "workplace-agent",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --filter @workplace-agent/web dev",
+    "build": "pnpm --filter @workplace-agent/web build",
+    "typecheck": "pnpm --filter @workplace-agent/web typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

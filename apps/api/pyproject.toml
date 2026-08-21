@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workplace-agent-api"
+version = "0.1.0"
+description = "大学生职场适应智能体 V0.1 后端"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.18,<2",
+  "asyncmy>=0.2.10,<1",
+  "cryptography>=44,<51",
+  "fastapi>=0.116,<1",
+  "email-validator>=2.2,<3",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "sqlalchemy>=2.0.51,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "aiosqlite>=0.22,<1",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
