@@ -20,7 +20,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="可信职场问答、可控长期记忆、知识检索与行动计划 API。",
+    description="可信职场问答、可控长期记忆、联网检索与行动工具 API。",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -54,6 +54,7 @@ async def ready(session: SessionDep) -> dict[str, object]:
         "dependencies": {
             "storage": settings.database_backend,
             "deepseek": "enabled" if settings.deepseek_enabled else "demo-mode",
+            "web_search": "enabled" if settings.online_search_available else "not-configured",
         },
     }
 

@@ -1,6 +1,8 @@
 # 大学生职场适应智能体
 
-V0.1 全栈基线：React 前端与 FastAPI 模块化单体后端。
+V0.2 全栈实现：React 前端、FastAPI 模块化单体后端，以及可审计的工具运行时。
+
+本版本新增 DeepSeek 原生 Tool Calling、Tavily 联网搜索、来源追溯、日历事件草稿、工具目录与调用审计。联网搜索未配置时会明确返回不可用，不会伪造实时结果。
 
 ## 本地开发
 
@@ -26,6 +28,8 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 接口文档位于 <http://localhost:8000/docs>。业务数据持久化到 MySQL；未配置 DeepSeek Key 时，后端自动使用演示回复。
+
+启用联网搜索时，在 `apps/api/.env` 设置 `TAVILY_API_KEY`。对话中的时效性问题会由 DeepSeek 选择 `web.search`，前端会显示工具执行状态和可点击来源。也可通过 `GET /api/v1/tools` 查看工具目录，或调用 `POST /api/v1/tools/web.search:invoke` 进行独立验证。
 
 ## 质量检查
 

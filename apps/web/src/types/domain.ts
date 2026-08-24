@@ -4,8 +4,18 @@ export interface Citation {
   id: string;
   title: string;
   source: string;
+  url: string;
   snippet: string;
-  trustLevel: 'A' | 'B' | 'C';
+  publishedAt?: string;
+}
+
+export interface ReasoningStep {
+  id: string;
+  title: string;
+  detail: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  kind: 'analysis' | 'plan' | 'tool' | 'answer';
+  elapsedMs?: number;
 }
 
 export interface ChatMessage {
@@ -14,6 +24,7 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   citations?: Citation[];
+  reasoningSteps?: ReasoningStep[];
 }
 
 export type MemoryType = 'profile' | 'preference' | 'goal' | 'experience';

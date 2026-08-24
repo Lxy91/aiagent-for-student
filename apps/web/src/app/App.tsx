@@ -117,7 +117,7 @@ function AppShell() {
           <div className="header-context">
             <span className="status-dot" />
             <span>服务已连接</span>
-            <span className="trace-label">V0.1 · FastAPI</span>
+            <span className="trace-label">V0.2 · Tool Runtime</span>
           </div>
           <Space size={8}>
             <Tooltip title="深色模式将在后续版本开放">

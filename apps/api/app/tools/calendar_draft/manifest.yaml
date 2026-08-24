@@ -1,0 +1,9 @@
+name: calendar.create_event_draft
+version: 1.0.0
+effect: draft
+timeout_seconds: 5
+max_retries: 0
+idempotency: required
+confirmation_required: false
+input_schema: CalendarDraftInput
+output_schema: CalendarDraftOutput

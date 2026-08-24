@@ -22,7 +22,8 @@ import {
   Tag,
 } from 'antd';
 import type { Dayjs } from 'dayjs';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { PageHeader } from '../../../components/PageHeader';
 import { StateCard } from '../../../components/StateCard';
 import { apiClient } from '../../../services/api-client';
@@ -80,6 +81,8 @@ export function PlansPage() {
   const { message } = App.useApp();
   const [createOpen, setCreateOpen] = useState(false);
   const [form] = Form.useForm<{ goal: string; deadline?: Dayjs }>();
+  const location = useLocation();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: ['plans'], queryFn: apiClient.getPlans });
   const updateTask = useMutation({
@@ -103,6 +106,14 @@ export function PlansPage() {
   const plan = data?.[0];
   const completedCount = plan?.tasks.filter((task) => task.status === 'done').length ?? 0;
   const progress = plan ? Math.round((completedCount / plan.tasks.length) * 100) : 0;
+
+  useEffect(() => {
+    const state = location.state as { goal?: string } | null;
+    if (!state?.goal) return;
+    form.setFieldValue('goal', state.goal);
+    setCreateOpen(true);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [form, location.pathname, location.state, navigate]);
 
   return (
     <div className="page-container plans-page">

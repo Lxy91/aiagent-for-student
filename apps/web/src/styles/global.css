@@ -408,6 +408,51 @@ button {
 .message-bubble p:last-child {
   margin-bottom: 0;
 }
+.reasoning-trace {
+  margin: 0 0 18px;
+  border-bottom: 1px solid #e4e8e5;
+}
+.reasoning-trace .ant-collapse-header {
+  padding: 4px 0 14px !important;
+  color: #77807c !important;
+  font-size: 13px;
+}
+.reasoning-trace .ant-collapse-content-box {
+  padding: 10px 0 18px !important;
+}
+.reasoning-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.reasoning-log {
+  display: grid;
+  gap: 18px;
+}
+.reasoning-narrative {
+  margin: 0;
+  color: #38423e;
+  font-size: 14px;
+  line-height: 1.85;
+}
+.reasoning-narrative.running {
+  color: #66716c;
+}
+.reasoning-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #848c88;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.reasoning-tool-row.failed {
+  color: #b44b4b;
+}
+.reasoning-tool-row .anticon {
+  flex: 0 0 auto;
+  font-size: 15px;
+}
 .message-actions {
   margin-top: 8px;
 }
@@ -419,7 +464,19 @@ button {
   gap: 8px;
   margin-top: 16px;
 }
-.citation-list button {
+.citation-collapse {
+  margin-top: 10px;
+  border-top: 1px solid #e5e9e3;
+}
+.citation-collapse .ant-collapse-header {
+  padding-inline: 0 !important;
+  color: #557469 !important;
+  font-size: 12px;
+}
+.citation-collapse .ant-collapse-content-box {
+  padding-inline: 0 !important;
+}
+.citation-list a {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -430,15 +487,30 @@ button {
   color: #385149;
   background: #fafcf9;
   text-align: left;
+  text-decoration: none;
 }
-.citation-list button:hover {
+.citation-list a:hover {
   border-color: #90b1a5;
   background: #f2f7f4;
 }
-.citation-list button span {
+.citation-list a > span:not(.ant-tag) {
   flex: 1;
+  min-width: 0;
+}
+.citation-list a strong,
+.citation-list a small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.citation-list a strong {
   font-size: 12px;
-  font-weight: 600;
+}
+.citation-list a small {
+  margin-top: 2px;
+  color: #89938f;
+  font-size: 10px;
 }
 .citation-list .ant-tag {
   margin: 0;
@@ -486,6 +558,19 @@ button {
 .composer-wrap {
   padding: 10px max(6%, calc((100% - 820px) / 2)) 18px;
   background: linear-gradient(to top, #f3f4ee 78%, transparent);
+}
+.tool-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  margin: 0 0 9px;
+  padding: 7px 11px;
+  border: 1px solid #d8e4dc;
+  border-radius: 18px;
+  color: #3d7061;
+  background: #f5f9f6;
+  font-size: 11px;
 }
 .starter-prompts {
   display: flex;

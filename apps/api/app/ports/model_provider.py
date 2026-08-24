@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator, Sequence
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class ModelProvider(Protocol):
-    async def stream_chat(self, messages: Sequence[dict[str, str]]) -> AsyncIterator[str]: ...
+    async def stream_chat(self, messages: Sequence[dict[str, Any]]) -> AsyncIterator[str]: ...

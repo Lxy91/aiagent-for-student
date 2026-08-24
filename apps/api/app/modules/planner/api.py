@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter
 
+from app.api.dependencies import SettingsDep
 from app.core.security import CurrentUserDep
 from app.infrastructure.db.session import SessionDep
 from app.modules.planner.schemas import (
@@ -19,9 +20,12 @@ router = APIRouter(tags=["planner"])
 
 @router.post("/plans:draft", response_model=PlanDraftResponse, status_code=201)
 async def create_plan_draft(
-    payload: CreatePlanDraftRequest, current_user: CurrentUserDep, session: SessionDep
+    payload: CreatePlanDraftRequest,
+    current_user: CurrentUserDep,
+    settings: SettingsDep,
+    session: SessionDep,
 ) -> PlanDraftResponse:
-    return await PlannerService(session).draft(current_user.id, payload)
+    return await PlannerService(session, settings).draft(current_user.id, payload)
 
 
 @router.post("/plan-drafts/{draft_id}:confirm", response_model=PlanResponse, status_code=201)

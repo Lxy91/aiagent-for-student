@@ -1,0 +1,9 @@
+name: web.search
+version: 1.0.0
+effect: read
+timeout_seconds: 16
+max_retries: 0
+idempotency: not_required
+confirmation_required: false
+input_schema: WebSearchInput
+output_schema: WebSearchOutput

@@ -1,9 +1,11 @@
 import type {
   ChatMessage,
+  Citation,
   KnowledgeDocument,
   MemoryItem,
   MemoryType,
   Plan,
+  ReasoningStep,
   TaskStatus,
 } from '../types/domain';
 import { clearStoredSession, getStoredSession, type StoredSession } from './session';
@@ -136,7 +138,28 @@ export const apiClient = {
   },
   async getMessages(conversationId: string): Promise<ChatMessage[]> {
     const items = await request<
-      Array<{ id: string; role: 'user' | 'assistant'; content: string; created_at: string }>
+      Array<{
+        id: string;
+        role: 'user' | 'assistant';
+        content: string;
+        created_at: string;
+        citations: Array<{
+          id: string;
+          title: string;
+          url: string;
+          snippet: string;
+          source: string;
+          published_at?: string;
+        }>;
+        reasoning_steps: Array<{
+          id: string;
+          title: string;
+          detail: string;
+          status: ReasoningStep['status'];
+          kind: ReasoningStep['kind'];
+          elapsed_ms?: number;
+        }>;
+      }>
     >(`/conversations/${conversationId}/messages`);
     return items.map((item) => ({
       id: item.id,
@@ -146,12 +169,35 @@ export const apiClient = {
         hour: '2-digit',
         minute: '2-digit',
       }),
+      citations: item.citations.map((citation) => ({
+        id: citation.id,
+        title: citation.title,
+        url: citation.url,
+        snippet: citation.snippet,
+        source: citation.source,
+        publishedAt: citation.published_at,
+      })),
+      reasoningSteps: item.reasoning_steps.map((step) => ({
+        id: step.id,
+        title: step.title,
+        detail: step.detail,
+        status: step.status,
+        kind: step.kind,
+        elapsedMs: Number(step.elapsed_ms ?? 0),
+      })),
     }));
   },
   async streamMessage(
     conversationId: string,
     content: string,
-    handlers: { onStarted: (id: string) => void; onDelta: (text: string) => void },
+    handlers: {
+      onStarted: (id: string) => void;
+      onDelta: (text: string) => void;
+      onToolStarted?: (tool: string) => void;
+      onToolCompleted?: (tool: string, resultCount: number) => void;
+      onCitations?: (items: Citation[]) => void;
+      onReasoningStep?: (step: ReasoningStep) => void;
+    },
     signal: AbortSignal,
   ) {
     const session = getStoredSession();
@@ -184,6 +230,31 @@ export const apiClient = {
         const data = JSON.parse(dataText) as Record<string, unknown>;
         if (event === 'message.started') handlers.onStarted(String(data.message_id));
         if (event === 'message.delta') handlers.onDelta(String(data.text));
+        if (event === 'tool.started') handlers.onToolStarted?.(String(data.tool));
+        if (event === 'tool.completed') {
+          handlers.onToolCompleted?.(String(data.tool), Number(data.result_count ?? 0));
+        }
+        if (event === 'citations') {
+          const items = (data.items as Array<Record<string, unknown>>).map((item) => ({
+            id: String(item.id),
+            title: String(item.title),
+            url: String(item.url),
+            snippet: String(item.snippet),
+            source: String(item.source),
+            publishedAt: item.published_at ? String(item.published_at) : undefined,
+          }));
+          handlers.onCitations?.(items);
+        }
+        if (event === 'reasoning.step') {
+          handlers.onReasoningStep?.({
+            id: String(data.id),
+            title: String(data.title),
+            detail: String(data.detail),
+            status: data.status as ReasoningStep['status'],
+            kind: data.kind as ReasoningStep['kind'],
+            elapsedMs: Number(data.elapsed_ms ?? 0),
+          });
+        }
         if (event === 'error') throw new ApiError(String(data.message), 502, String(data.code));
       }
     }

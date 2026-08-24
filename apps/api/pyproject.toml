@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workplace-agent-api"
-version = "0.1.0"
-description = "大学生职场适应智能体 V0.1 后端"
+version = "0.2.0"
+description = "大学生职场适应智能体 V0.2 后端"
 requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.18,<2",

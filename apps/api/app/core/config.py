@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "大学生职场适应智能体 API"
-    app_version: str = "0.1.0"
+    app_version: str = "0.2.0"
     app_env: str = "development"
     app_secret_key: str = "development-only-change-me"
     app_cors_origins: Annotated[list[str], NoDecode] = Field(
@@ -29,7 +29,16 @@ class Settings(BaseSettings):
     deepseek_timeout_seconds: float = 60.0
     demo_mode: bool = True
 
+    web_search_provider: str = "tavily"
+    web_search_enabled: bool = True
+    tavily_api_key: str | None = None
+    tavily_base_url: str = "https://api.tavily.com"
+    web_search_timeout_seconds: float = 15.0
+    web_search_max_results: int = 5
+
     max_upload_bytes: int = 20 * 1024 * 1024
+    worker_poll_seconds: float = 2.0
+    worker_batch_size: int = 50
 
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306
@@ -49,6 +58,14 @@ class Settings(BaseSettings):
     @property
     def deepseek_enabled(self) -> bool:
         return bool(self.deepseek_api_key) and not self.demo_mode
+
+    @property
+    def online_search_available(self) -> bool:
+        return (
+            self.web_search_enabled
+            and self.web_search_provider == "tavily"
+            and bool(self.tavily_api_key)
+        )
 
     @property
     def database_url(self) -> URL:
