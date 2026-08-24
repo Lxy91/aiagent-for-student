@@ -14,7 +14,15 @@ class ConversationResponse(BaseModel):
     id: UUID
     title: str
     mode: str
+    is_pinned: bool
+    is_archived: bool
     created_at: datetime
+
+
+class UpdateConversationRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    is_pinned: bool | None = None
+    is_archived: bool | None = None
 
 
 class SendMessageRequest(BaseModel):

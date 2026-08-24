@@ -7,19 +7,36 @@ import {
   GlobalOutlined,
   LinkOutlined,
   LoadingOutlined,
+  MoreOutlined,
   PlusOutlined,
+  PushpinFilled,
+  PushpinOutlined,
+  EditOutlined,
+  InboxOutlined,
   SendOutlined,
   StopOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { App, Avatar, Button, Collapse, Input, Segmented, Space, Tag, Tooltip } from 'antd';
+import {
+  App,
+  Avatar,
+  Button,
+  Collapse,
+  Dropdown,
+  Input,
+  Modal,
+  Segmented,
+  Space,
+  Tag,
+  Tooltip,
+} from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BrandMark } from '../../../components/BrandMark';
 import { StateCard } from '../../../components/StateCard';
 import { apiClient } from '../../../services/api-client';
-import type { ChatMessage, ReasoningStep } from '../../../types/domain';
+import type { ChatMessage, Conversation, ReasoningStep } from '../../../types/domain';
 
 const starterPrompts = ['怎么向领导澄清任务？', '帮我准备第一次周会', '把模糊目标拆成计划'];
 
@@ -96,6 +113,8 @@ export function ChatPage() {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState('');
   const [conversationId, setConversationId] = useState<string>();
+  const [renamingConversation, setRenamingConversation] = useState<Conversation>();
+  const [renameDraft, setRenameDraft] = useState('');
   const [generations, setGenerations] = useState<Record<string, ConversationGeneration>>({});
   const generationControllersRef = useRef(new Map<string, AbortController>());
   const conversations = useQuery({
@@ -108,6 +127,32 @@ export function ChatPage() {
       queryClient.setQueryData<ChatMessage[]>(['messages', conversation.id], []);
       setConversationId(conversation.id);
       await queryClient.invalidateQueries({ queryKey: ['conversations'] });
+    },
+  });
+  const updateConversation = useMutation({
+    mutationFn: ({
+      id,
+      changes,
+    }: {
+      id: string;
+      changes: { title?: string; is_pinned?: boolean; is_archived?: boolean };
+    }) => apiClient.updateConversation(id, changes),
+    onSuccess: async (updated) => {
+      queryClient.setQueryData<Conversation[]>(['conversations'], (items = []) =>
+        items
+          .map((item) => (item.id === updated.id ? updated : item))
+          .filter((item) => !item.is_archived)
+          .sort(
+            (left, right) =>
+              Number(right.is_pinned) - Number(left.is_pinned) ||
+              new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+          ),
+      );
+      if (updated.is_archived && conversationId === updated.id) setConversationId(undefined);
+      await queryClient.invalidateQueries({ queryKey: ['conversations'] });
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '操作失败');
     },
   });
   const messages = useQuery({
@@ -156,11 +201,7 @@ export function ChatPage() {
     queryClient.setQueryData<ChatMessage[]>(['messages', targetId], (items = []) => update(items));
   };
 
-  const updateGenerationStatus = (
-    targetId: string,
-    assistantId: string,
-    toolStatus: string,
-  ) => {
+  const updateGenerationStatus = (targetId: string, assistantId: string, toolStatus: string) => {
     setGenerations((items) => {
       const current = items[targetId];
       if (current?.assistantId !== assistantId) return items;
@@ -190,7 +231,9 @@ export function ChatPage() {
         targetId,
         trimmedContent,
         {
-          onStarted: () => undefined,
+          onStarted: () => {
+            void queryClient.invalidateQueries({ queryKey: ['conversations'] });
+          },
           onDelta: (text) =>
             updateCachedMessages(targetId, (items) =>
               items.map((item) =>
@@ -231,9 +274,7 @@ export function ChatPage() {
     } catch (error) {
       if (!controller.signal.aborted) {
         message.error(error instanceof Error ? error.message : '消息发送失败');
-        updateCachedMessages(targetId, (items) =>
-          items.filter((item) => item.id !== assistantId),
-        );
+        updateCachedMessages(targetId, (items) => items.filter((item) => item.id !== assistantId));
       }
     } finally {
       if (generationControllersRef.current.get(targetId) === controller) {
@@ -254,6 +295,21 @@ export function ChatPage() {
     message.info('已停止生成');
   };
 
+  const openRename = (conversation: Conversation) => {
+    setRenamingConversation(conversation);
+    setRenameDraft(conversation.title);
+  };
+
+  const submitRename = async () => {
+    const title = renameDraft.trim();
+    if (!renamingConversation || !title) {
+      message.warning('会话名称不能为空');
+      return;
+    }
+    await updateConversation.mutateAsync({ id: renamingConversation.id, changes: { title } });
+    setRenamingConversation(undefined);
+  };
+
   return (
     <div className="chat-page">
       <aside className="conversation-panel">
@@ -268,14 +324,62 @@ export function ChatPage() {
         </Button>
         <div className="conversation-label">最近对话</div>
         {conversations.data?.map((conversation) => (
-          <button
+          <div
             key={conversation.id}
             className={`conversation-item ${conversation.id === conversationId ? 'active' : ''}`}
-            onClick={() => setConversationId(conversation.id)}
           >
-            <span>{conversation.title}</span>
-            <small>{new Date(conversation.created_at).toLocaleDateString('zh-CN')}</small>
-          </button>
+            <button
+              className="conversation-select"
+              onClick={() => setConversationId(conversation.id)}
+            >
+              <span>
+                {conversation.is_pinned ? <PushpinFilled className="conversation-pin" /> : null}
+                {conversation.title}
+              </span>
+              <small>{new Date(conversation.created_at).toLocaleDateString('zh-CN')}</small>
+            </button>
+            <Dropdown
+              trigger={['click']}
+              placement="bottomRight"
+              menu={{
+                items: [
+                  { key: 'rename', icon: <EditOutlined />, label: '重命名' },
+                  {
+                    key: 'pin',
+                    icon: <PushpinOutlined />,
+                    label: conversation.is_pinned ? '取消置顶' : '置顶',
+                  },
+                  { type: 'divider' },
+                  { key: 'archive', icon: <InboxOutlined />, label: '归档', danger: true },
+                ],
+                onClick: ({ key, domEvent }) => {
+                  domEvent.stopPropagation();
+                  if (key === 'rename') openRename(conversation);
+                  if (key === 'pin') {
+                    updateConversation.mutate({
+                      id: conversation.id,
+                      changes: { is_pinned: !conversation.is_pinned },
+                    });
+                  }
+                  if (key === 'archive') {
+                    updateConversation.mutate({
+                      id: conversation.id,
+                      changes: { is_archived: true },
+                    });
+                  }
+                },
+              }}
+            >
+              <Button
+                className="conversation-more"
+                type="text"
+                size="small"
+                icon={<MoreOutlined />}
+                aria-label={`更多操作：${conversation.title}`}
+                onClick={(event) => event.stopPropagation()}
+              />
+            </Dropdown>
+          </div>
         ))}
         <div className="privacy-note">
           <CheckCircleFilled />
@@ -453,6 +557,25 @@ export function ChatPage() {
           </Button>
         </div>
       </main>
+      <Modal
+        title="重命名会话"
+        open={Boolean(renamingConversation)}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={updateConversation.isPending}
+        onOk={() => void submitRename()}
+        onCancel={() => setRenamingConversation(undefined)}
+      >
+        <Input
+          value={renameDraft}
+          maxLength={100}
+          showCount
+          autoFocus
+          aria-label="会话名称"
+          onChange={(event) => setRenameDraft(event.target.value)}
+          onPressEnter={() => void submitRename()}
+        />
+      </Modal>
     </div>
   );
 }

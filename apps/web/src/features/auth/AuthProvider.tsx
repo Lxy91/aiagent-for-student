@@ -1,6 +1,14 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Alert, Button, Card, Form, Input, Segmented, Typography } from 'antd';
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react';
 import { BrandMark } from '../../components/BrandMark';
 import { apiClient } from '../../services/api-client';
 import {
@@ -24,26 +32,29 @@ export function useAuth() {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
   const [session, setSession] = useState(getStoredSession);
-  const logout = () => {
+  const logout = useCallback(() => {
     clearStoredSession();
+    queryClient.clear();
     setSession(null);
-  };
+  }, [queryClient]);
+  const authenticate = useCallback(
+    (next: StoredSession) => {
+      queryClient.clear();
+      storeSession(next);
+      setSession(next);
+    },
+    [queryClient],
+  );
   useEffect(() => {
     window.addEventListener('workplace-agent:unauthorized', logout);
     return () => window.removeEventListener('workplace-agent:unauthorized', logout);
-  }, []);
-  const value = useMemo(() => ({ session, logout }), [session]);
+  }, [logout]);
+  const value = useMemo(() => ({ session, logout }), [session, logout]);
 
   if (!session) {
-    return (
-      <AuthPage
-        onAuthenticated={(next) => {
-          storeSession(next);
-          setSession(next);
-        }}
-      />
-    );
+    return <AuthPage onAuthenticated={authenticate} />;
   }
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

@@ -27,6 +27,8 @@ class ConversationModel(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(100))
     mode: Mapped[str] = mapped_column(String(20), default="standard")
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
     messages: Mapped[list["MessageModel"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"

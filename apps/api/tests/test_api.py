@@ -55,11 +55,89 @@ def test_conversation_stream(client: TestClient, auth_headers: dict[str, str]) -
     assert "event: message.completed" in response.text
     assert '"demo_mode": true' in response.text
 
-    messages = client.get(
-        f"/api/v1/conversations/{conversation_id}/messages", headers=auth_headers
-    )
+    messages = client.get(f"/api/v1/conversations/{conversation_id}/messages", headers=auth_headers)
     assert messages.status_code == 200
     assert [item["role"] for item in messages.json()] == ["user", "assistant"]
+
+
+def test_conversation_rename_pin_and_archive(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    first = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "第一个会话", "mode": "standard"},
+    ).json()
+    second = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "第二个会话", "mode": "standard"},
+    ).json()
+
+    updated = client.patch(
+        f"/api/v1/conversations/{first['id']}",
+        headers=auth_headers,
+        json={"title": "  重命名后的会话  ", "is_pinned": True},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["title"] == "重命名后的会话"
+    assert updated.json()["is_pinned"] is True
+
+    conversations = client.get("/api/v1/conversations", headers=auth_headers).json()
+    assert conversations[0]["id"] == first["id"]
+
+    archived = client.patch(
+        f"/api/v1/conversations/{first['id']}",
+        headers=auth_headers,
+        json={"is_archived": True},
+    )
+    assert archived.status_code == 200
+    conversations = client.get("/api/v1/conversations", headers=auth_headers).json()
+    assert [item["id"] for item in conversations] == [second["id"]]
+
+
+def test_first_question_becomes_default_conversation_title(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    conversation = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "新对话", "mode": "standard"},
+    ).json()
+
+    with client.stream(
+        "POST",
+        f"/api/v1/conversations/{conversation['id']}/messages:stream",
+        headers=auth_headers,
+        json={"content": "请帮我准备第一次周会？"},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    updated = client.get("/api/v1/conversations", headers=auth_headers).json()[0]
+    assert updated["title"] == "准备第一次周会"
+
+
+def test_first_question_does_not_overwrite_manual_conversation_title(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    conversation = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "我的自定义名称", "mode": "standard"},
+    ).json()
+
+    with client.stream(
+        "POST",
+        f"/api/v1/conversations/{conversation['id']}/messages:stream",
+        headers=auth_headers,
+        json={"content": "这是第一个问题"},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    updated = client.get("/api/v1/conversations", headers=auth_headers).json()[0]
+    assert updated["title"] == "我的自定义名称"
 
 
 def test_memory_confirmation_and_delete(client: TestClient, auth_headers: dict[str, str]) -> None:
@@ -196,9 +274,7 @@ def test_chat_stream_emits_tool_events_and_persists_citations(
 
     selections = 0
 
-    async def fake_select(
-        self, messages, tools, *, force_tool_name=None, allow_tool_calls=True
-    ):
+    async def fake_select(self, messages, tools, *, force_tool_name=None, allow_tool_calls=True):
         nonlocal selections
         del self, messages, tools, force_tool_name
         if not allow_tool_calls or selections:
@@ -289,9 +365,7 @@ def test_chat_trace_is_contextual_when_no_tool_is_selected(
     from app.core.config import Settings
     from app.infrastructure.llm.deepseek import DeepSeekProvider
 
-    async def fake_select(
-        self, messages, tools, *, force_tool_name=None, allow_tool_calls=True
-    ):
+    async def fake_select(self, messages, tools, *, force_tool_name=None, allow_tool_calls=True):
         del self, messages, tools, force_tool_name, allow_tool_calls
         return {
             "role": "assistant",

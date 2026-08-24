@@ -1,6 +1,7 @@
 import type {
   ChatMessage,
   Citation,
+  Conversation,
   KnowledgeDocument,
   MemoryItem,
   MemoryType,
@@ -126,15 +127,22 @@ export const apiClient = {
     return toSession(payload);
   },
   async getConversations() {
-    return request<Array<{ id: string; title: string; mode: string; created_at: string }>>(
-      '/conversations',
-    );
+    return request<Conversation[]>('/conversations');
   },
   async createConversation(title = '新对话') {
-    return request<{ id: string; title: string; mode: string; created_at: string }>(
-      '/conversations',
-      { method: 'POST', body: JSON.stringify({ title, mode: 'standard' }) },
-    );
+    return request<Conversation>('/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ title, mode: 'standard' }),
+    });
+  },
+  async updateConversation(
+    conversationId: string,
+    changes: { title?: string; is_pinned?: boolean; is_archived?: boolean },
+  ) {
+    return request<Conversation>(`/conversations/${conversationId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(changes),
+    });
   },
   async getMessages(conversationId: string): Promise<ChatMessage[]> {
     const items = await request<

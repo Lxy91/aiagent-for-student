@@ -16,6 +16,7 @@ from app.modules.chat.schemas import (
     CreateConversationRequest,
     MessageResponse,
     SendMessageRequest,
+    UpdateConversationRequest,
 )
 from app.modules.chat.service import (
     ConversationService,
@@ -75,6 +76,16 @@ async def list_conversations(
     return await ConversationService(session).list(current_user.id)
 
 
+@router.patch("/{conversation_id}", response_model=ConversationResponse)
+async def update_conversation(
+    conversation_id: UUID,
+    payload: UpdateConversationRequest,
+    current_user: CurrentUserDep,
+    session: SessionDep,
+) -> ConversationResponse:
+    return await ConversationService(session).update(current_user.id, conversation_id, payload)
+
+
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
 async def list_messages(
     conversation_id: UUID, current_user: CurrentUserDep, session: SessionDep
@@ -93,6 +104,7 @@ async def stream_message(
 ) -> StreamingResponse:
     service = ConversationService(session)
     await service.get_owned(current_user.id, conversation_id)
+    await service.apply_first_message_title(current_user.id, conversation_id, payload.content)
     await service.add_message(conversation_id, "user", payload.content)
     trace_id = request.state.trace_id
     registry = build_tool_registry(session, settings)
@@ -122,9 +134,7 @@ async def stream_message(
         tool_call_count = 0
         last_plan_step: dict | None = None
 
-        def update_step(
-            step_id: str, title: str, detail: str, status: str, kind: str
-        ) -> dict:
+        def update_step(step_id: str, title: str, detail: str, status: str, kind: str) -> dict:
             step = {
                 "id": step_id,
                 "title": title,
@@ -340,9 +350,7 @@ async def stream_message(
                 yield sse("message.delta", {"text": chunk})
             full_response = sanitize_assistant_content(full_response)
             if not full_response:
-                raise AppError(
-                    "MODEL_EMPTY_RESPONSE", "模型未生成可展示的回答", status_code=502
-                )
+                raise AppError("MODEL_EMPTY_RESPONSE", "模型未生成可展示的回答", status_code=502)
             if last_plan_step is not None:
                 yield sse(
                     "reasoning.step",

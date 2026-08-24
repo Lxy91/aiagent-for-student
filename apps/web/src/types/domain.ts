@@ -27,6 +27,15 @@ export interface ChatMessage {
   reasoningSteps?: ReasoningStep[];
 }
 
+export interface Conversation {
+  id: string;
+  title: string;
+  mode: string;
+  is_pinned: boolean;
+  is_archived: boolean;
+  created_at: string;
+}
+
 export type MemoryType = 'profile' | 'preference' | 'goal' | 'experience';
 
 export interface MemoryItem {

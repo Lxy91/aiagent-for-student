@@ -270,30 +270,60 @@ button {
   text-transform: uppercase;
 }
 .conversation-item {
+  position: relative;
+  display: flex;
+  align-items: center;
   width: 100%;
   margin-bottom: 5px;
-  padding: 11px 12px;
-  border: 0;
   border-radius: 11px;
   color: #4f5d57;
   background: transparent;
-  text-align: left;
 }
-.conversation-item span,
-.conversation-item small {
+.conversation-select {
+  min-width: 0;
+  flex: 1;
+  padding: 11px 38px 11px 12px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.conversation-select > span,
+.conversation-select > small {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.conversation-item span {
+.conversation-select > span {
   font-size: 13px;
   font-weight: 600;
 }
-.conversation-item small {
+.conversation-select > small {
   margin-top: 4px;
   color: #9da5a1;
   font-size: 11px;
+}
+.conversation-pin {
+  margin-right: 5px;
+  color: #34705f;
+  font-size: 11px;
+}
+.conversation-more {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 0.16s ease;
+}
+.conversation-item:hover .conversation-more,
+.conversation-item:focus-within .conversation-more {
+  opacity: 1;
+}
+.conversation-item:hover {
+  background: #f0f4f1;
 }
 .conversation-item.active {
   color: #255e53;

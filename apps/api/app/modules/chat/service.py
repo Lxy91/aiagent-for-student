@@ -14,6 +14,7 @@ from app.modules.chat.schemas import (
     ConversationResponse,
     CreateConversationRequest,
     MessageResponse,
+    UpdateConversationRequest,
 )
 
 
@@ -28,6 +29,22 @@ def sanitize_assistant_content(content: str) -> str:
         )
     ]
     return "\n".join(lines).strip()
+
+
+def summarize_conversation_title(content: str, max_length: int = 24) -> str:
+    """Build a stable sidebar title from the first user question."""
+    normalized = " ".join(content.split()).strip()
+    for prefix in ("请问", "请帮我", "帮我", "我想问一下", "我想问"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].lstrip("，,:： ")
+            break
+    normalized = normalized.strip("#*` ")
+    normalized = normalized.rstrip("。！？!?~ ")
+    if not normalized:
+        return "新对话"
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[:max_length].rstrip()}…"
 
 
 class ExecutionNarrative(BaseModel):
@@ -59,7 +76,7 @@ async def build_execution_narrative(
                     "role": "system",
                     "content": (
                         "你负责生成可展示给用户的执行摘要，不回答用户问题，也不输出隐藏思维链。"
-                        "只输出 JSON：{\"understanding\":\"...\",\"next_action\":\"...\"}。"
+                        '只输出 JSON：{"understanding":"...","next_action":"..."}。'
                         "understanding 用一句自然中文具体概括当前问题重点；next_action 用第一人称"
                         "具体说明已经决定的下一步。两项都不超过 80 个汉字。只有已确定动作包含"
                         " web.search 时，才能提到联网、最新、时效性或来源核对；没有选择工具时，"
@@ -82,8 +99,7 @@ async def build_execution_narrative(
             "核对来源",
         )
         if "web.search" not in selected_tools and any(
-            marker in narrative.next_action
-            for marker in forbidden_web_markers
+            marker in narrative.next_action for marker in forbidden_web_markers
         ):
             raise ValueError("Narrative mentions web work that was not selected")
         stale_planning_markers = (
@@ -96,9 +112,10 @@ async def build_execution_narrative(
             "决定是否",
             "进一步搜索",
         )
-        if observations and not selected_tools and any(
-            marker in narrative.next_action
-            for marker in stale_planning_markers
+        if (
+            observations
+            and not selected_tools
+            and any(marker in narrative.next_action for marker in stale_planning_markers)
         ):
             raise ValueError("Narrative ignores completed tool observations")
         return narrative
@@ -137,10 +154,48 @@ class ConversationService:
     async def list(self, user_id: UUID) -> list[ConversationResponse]:
         result = await self.session.scalars(
             select(ConversationModel)
-            .where(ConversationModel.user_id == str(user_id))
-            .order_by(ConversationModel.created_at.desc())
+            .where(
+                ConversationModel.user_id == str(user_id),
+                ConversationModel.is_archived.is_(False),
+            )
+            .order_by(ConversationModel.is_pinned.desc(), ConversationModel.created_at.desc())
         )
         return [self._conversation_response(item) for item in result]
+
+    async def update(
+        self,
+        user_id: UUID,
+        conversation_id: UUID,
+        payload: UpdateConversationRequest,
+    ) -> ConversationResponse:
+        item = await self.get_owned(user_id, conversation_id)
+        changes = payload.model_dump(exclude_unset=True)
+        if "title" in changes:
+            title = (changes["title"] or "").strip()
+            if not title:
+                raise AppError("INVALID_CONVERSATION_TITLE", "会话名称不能为空", status_code=422)
+            changes["title"] = title
+        for field, value in changes.items():
+            setattr(item, field, value)
+        await self.session.commit()
+        await self.session.refresh(item)
+        return self._conversation_response(item)
+
+    async def apply_first_message_title(
+        self, user_id: UUID, conversation_id: UUID, content: str
+    ) -> ConversationResponse:
+        """Replace the placeholder title once, without overwriting a manual rename."""
+        item = await self.get_owned(user_id, conversation_id)
+        first_message_id = await self.session.scalar(
+            select(MessageModel.id)
+            .where(MessageModel.conversation_id == str(conversation_id))
+            .limit(1)
+        )
+        if item.title == "新对话" and first_message_id is None:
+            item.title = summarize_conversation_title(content)
+            await self.session.commit()
+            await self.session.refresh(item)
+        return self._conversation_response(item)
 
     async def get_owned(self, user_id: UUID, conversation_id: UUID) -> ConversationModel:
         item = await self.session.scalar(
@@ -194,9 +249,7 @@ class ConversationService:
             for item in items
         ]
 
-    async def list_messages(
-        self, user_id: UUID, conversation_id: UUID
-    ) -> list[MessageResponse]:
+    async def list_messages(self, user_id: UUID, conversation_id: UUID) -> list[MessageResponse]:
         await self.get_owned(user_id, conversation_id)
         result = await self.session.scalars(
             select(MessageModel)
@@ -226,5 +279,7 @@ class ConversationService:
             id=item.id,
             title=item.title,
             mode=item.mode,
+            is_pinned=item.is_pinned,
+            is_archived=item.is_archived,
             created_at=item.created_at,
         )
