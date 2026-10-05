@@ -514,13 +514,18 @@ export function ChatPage() {
             <h1>{selectedConversation?.title ?? '新对话'}</h1>
             <span>V0.3 · 可追溯资料与成长闭环</span>
           </div>
-          <Segmented options={['标准对话', '临时对话']} size="small" />
+          <Segmented
+            className="chat-mode-switch"
+            options={['标准对话', '临时对话']}
+            size="small"
+          />
         </div>
 
         <StateCard
           loading={conversations.isLoading || messages.isLoading}
           empty={!localMessages.length}
-          emptyText="开始第一次对话"
+          emptyText="有什么我可以帮你的吗？"
+          emptyClassName="chat-empty-state"
         >
           <div className="message-stream">
             {localMessages.map((item) => (
@@ -702,7 +707,7 @@ export function ChatPage() {
                       </span>
                       <span title={attachment.title}>{attachment.title}</span>
                       <Button
-                        type="text"
+                        type="default"
                         size="small"
                         icon={<DeleteOutlined />}
                         aria-label={`移除附件：${attachment.title}`}

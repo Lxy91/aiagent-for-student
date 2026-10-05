@@ -20,6 +20,8 @@ from app.modules.artifacts.editor import (
 )
 from app.modules.artifacts.service import (
     artifact_generation_instruction,
+    build_docx,
+    build_xlsx,
     requested_artifact_types,
 )
 from app.modules.chat.api import (
@@ -94,6 +96,18 @@ def test_artifact_routing_only_matches_explicit_download_requests() -> None:
     assert "具备生成并提供可下载的 Word（DOCX）文件的能力" in instruction
     assert "不得声称无法生成" in instruction
     assert artifact_generation_instruction("帮我分析一下职业规划") == ""
+
+
+def test_generated_artifact_uses_ai_authored_document_title() -> None:
+    prompt = "这是什么，根据这个帮我写一份自我介绍并生成 Word 文档"
+    content = "# 前端岗位面试自我介绍稿\n\n## 基本信息\n我是一名前端开发实习生。"
+
+    docx_filename, _ = build_docx(prompt, content)
+    xlsx_filename, _ = build_xlsx(prompt, content)
+
+    assert docx_filename == "前端岗位面试自我介绍稿.docx"
+    assert xlsx_filename == "前端岗位面试自我介绍稿.xlsx"
+    assert "这是什么" not in docx_filename
     narrative = artifact_execution_narrative(("docx",), [])
     assert narrative.understanding == "你希望把本次内容整理成Word 文档并直接下载。"
     assert narrative.next_action == "我会整理适合写入文件的完整内容，并生成可下载的Word 文档。"

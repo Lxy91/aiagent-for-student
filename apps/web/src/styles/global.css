@@ -402,6 +402,42 @@ button {
   color: #8d9692;
   font-size: 12px;
 }
+.chat-mode-switch.ant-segmented {
+  padding: 3px;
+  border: 1px solid #cfd8d2;
+  border-radius: 9px;
+  background: #f7f8f4;
+  box-shadow: 0 2px 8px rgb(43 59 51 / 5%);
+}
+.chat-empty-state.ant-card {
+  flex: 1;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.chat-empty-state .ant-card-body {
+  display: grid;
+  height: 100%;
+  place-items: center;
+  padding: 28px;
+}
+.chat-empty-state .ant-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.chat-empty-state .ant-empty-image {
+  order: 2;
+  margin-bottom: 0;
+}
+.chat-empty-state .ant-empty-description {
+  order: 1;
+  margin-bottom: 48px;
+  color: #596861;
+  font-size: 20px;
+  font-weight: 600;
+}
 .message-stream {
   flex: 1;
   overflow-y: auto;
@@ -962,12 +998,20 @@ button {
   align-items: center;
   min-width: 0;
 }
+.composer-actions-left .ant-upload-wrapper {
+  margin-right: 6px;
+  margin-left: 12px;
+}
 .composer-actions-left > span {
   color: #9ba39f;
   font-size: 10px;
 }
 .composer-actions-left .ant-btn {
   color: #587069;
+}
+.composer-actions-left .ant-btn-default {
+  border-color: #cfd8d2;
+  background: #fbfcfa;
 }
 .plan-convert {
   display: block;

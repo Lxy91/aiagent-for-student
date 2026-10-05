@@ -5,10 +5,17 @@ interface StateCardProps {
   loading: boolean;
   empty?: boolean;
   emptyText?: string;
+  emptyClassName?: string;
   children: ReactNode;
 }
 
-export function StateCard({ loading, empty, emptyText = '暂无内容', children }: StateCardProps) {
+export function StateCard({
+  loading,
+  empty,
+  emptyText = '暂无内容',
+  emptyClassName,
+  children,
+}: StateCardProps) {
   if (loading) {
     return (
       <Card className="surface-card">
@@ -19,7 +26,7 @@ export function StateCard({ loading, empty, emptyText = '暂无内容', children
 
   if (empty) {
     return (
-      <Card className="surface-card">
+      <Card className={`surface-card ${emptyClassName ?? ''}`.trim()}>
         <Empty description={emptyText} />
       </Card>
     );

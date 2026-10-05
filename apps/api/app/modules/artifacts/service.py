@@ -66,6 +66,10 @@ def artifact_generation_instruction(content: str) -> str:
     return (
         f"当前系统具备生成并提供可下载的 {file_label}文件的能力。"
         "用户已明确要求创作文件，请直接撰写适合写入文件的完整内容；"
+        "正文第一行必须用一级 Markdown 标题‘# 文档标题’给出简洁、正式的"
+        "文件名称。标题应根据产物类型命名，例如‘个人简历分析报告’、"
+        "‘前端岗位面试自我介绍稿’或‘项目进度跟踪表’，不得复制或改写用户问题。"
+        "系统会使用该一级标题作为下载文件名。"
         "回复完成后，系统会自动生成文件并展示下载链接。"
         "不得声称无法生成、保存或下载文件，也不要让用户复制到本地软件自行创建。"
         "如果用户尚未指定主题或具体内容，请生成一份简洁、可继续编辑的通用模板，"
@@ -73,16 +77,47 @@ def artifact_generation_instruction(content: str) -> str:
     )
 
 
-def _safe_title(prompt: str) -> str:
-    title = re.sub(
-        r"(?i)(请|帮我|生成|导出|下载|制作|创建|word|docx|excel|xlsx|文档|表格|文件)",
-        "",
-        prompt,
-    )
+def _sanitize_title(title: str) -> str:
+    title = re.sub(r"[*_`~]", "", title)
     title = re.sub(r"[\\/:*?\"<>|\r\n]+", " ", title)
     title = " ".join(title.split()).strip(" ，。；：-")
-    title = re.sub(r"^(?:和|及|以及|与|并)[\s，。；：、-]*", "", title)
-    return (title or "对话内容整理")[:48]
+    return title[:48]
+
+
+def _document_title(content: str, artifact_type: str) -> str:
+    """Use the AI-authored H1 as the filename, with a semantic fallback."""
+    for line in content.splitlines():
+        heading = re.match(r"^\s*#\s+(.+?)\s*$", line)
+        if heading:
+            title = _sanitize_title(heading.group(1))
+            if title:
+                return title
+
+    semantic_titles = (
+        (("简历",), "个人简历分析报告"),
+        (("自我介绍", "面试"), "面试自我介绍稿"),
+        (("周报",), "工作周报"),
+        (("月报",), "工作月报"),
+        (("职业规划",), "职业发展规划报告"),
+        (("复盘",), "工作复盘报告"),
+        (("调研",), "调研分析报告"),
+        (("方案",), "工作方案"),
+    )
+    for markers, title in semantic_titles:
+        if all(marker in content for marker in markers):
+            return title
+    return "数据整理表" if artifact_type == "xlsx" else "智能对话整理报告"
+
+
+def _document_lines(content: str, title: str) -> list[str]:
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        heading = re.match(r"^\s*#\s+(.+?)\s*$", line)
+        if heading and _sanitize_title(heading.group(1)) == title:
+            return lines[:index] + lines[index + 1 :]
+        if line.strip():
+            break
+    return lines
 
 
 def _set_run_font(run, *, size: float, bold: bool = False, color: str = "222222") -> None:
@@ -160,7 +195,8 @@ def _parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]]]
 
 
 def build_docx(prompt: str, content: str) -> tuple[str, bytes]:
-    title = _safe_title(prompt)
+    del prompt
+    title = _document_title(content, "docx")
     document = Document()
     _configure_doc_styles(document)
 
@@ -176,7 +212,7 @@ def build_docx(prompt: str, content: str) -> tuple[str, bytes]:
     subtitle.paragraph_format.space_after = Pt(16)
     _set_run_font(subtitle.add_run("根据本次对话自动整理"), size=11, color="666666")
 
-    lines = content.splitlines()
+    lines = _document_lines(content, title)
     table_data = _parse_markdown_table(lines)
     table_lines: set[str] = set()
     if table_data:
@@ -224,7 +260,8 @@ def build_docx(prompt: str, content: str) -> tuple[str, bytes]:
 
 
 def build_xlsx(prompt: str, content: str) -> tuple[str, bytes]:
-    title = _safe_title(prompt)
+    del prompt
+    title = _document_title(content, "xlsx")
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "内容"
@@ -238,7 +275,7 @@ def build_xlsx(prompt: str, content: str) -> tuple[str, bytes]:
     sheet["A1"].alignment = Alignment(vertical="center")
     sheet.row_dimensions[1].height = 30
 
-    lines = content.splitlines()
+    lines = _document_lines(content, title)
     table_data = _parse_markdown_table(lines)
     if table_data:
         headers, rows = table_data
