@@ -20,7 +20,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="可信职场问答、可控长期记忆、联网检索与行动工具 API。",
+    description="可信职场问答、工作资料、成长证据与行动工具 API。",
     lifespan=lifespan,
 )
 app.add_middleware(

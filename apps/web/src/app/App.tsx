@@ -2,11 +2,13 @@ import {
   BookOutlined,
   BulbOutlined,
   CalendarOutlined,
+  FileSearchOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   MessageOutlined,
   MoonOutlined,
   SettingOutlined,
+  TrophyOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { Avatar, Button, Dropdown, Layout, Menu, Space, Tooltip } from 'antd';
@@ -30,6 +32,16 @@ const MemoryPage = lazy(() =>
 const PlansPage = lazy(() =>
   import('../features/plans/pages/PlansPage').then((module) => ({ default: module.PlansPage })),
 );
+const MaterialsPage = lazy(() =>
+  import('../features/materials/pages/MaterialsPage').then((module) => ({
+    default: module.MaterialsPage,
+  })),
+);
+const GrowthPage = lazy(() =>
+  import('../features/growth/pages/GrowthPage').then((module) => ({
+    default: module.GrowthPage,
+  })),
+);
 const SettingsPage = lazy(() =>
   import('../pages/SettingsPage').then((module) => ({ default: module.SettingsPage })),
 );
@@ -41,6 +53,8 @@ const navigationItems = [
   { key: '/plans', icon: <CalendarOutlined />, label: '行动计划' },
   { key: '/memory', icon: <BulbOutlined />, label: '记忆中心' },
   { key: '/knowledge', icon: <BookOutlined />, label: '知识库' },
+  { key: '/materials', icon: <FileSearchOutlined />, label: '资料收件箱' },
+  { key: '/growth', icon: <TrophyOutlined />, label: '成长档案' },
   { type: 'divider' as const },
   { key: '/settings', icon: <SettingOutlined />, label: '设置' },
 ];
@@ -117,7 +131,7 @@ function AppShell() {
           <div className="header-context">
             <span className="status-dot" />
             <span>服务已连接</span>
-            <span className="trace-label">V0.2 · Tool Runtime</span>
+            <span className="trace-label">V0.3 · Growth Loop</span>
           </div>
           <Space size={8}>
             <Tooltip title="深色模式将在后续版本开放">
@@ -159,6 +173,8 @@ export function App() {
         <Route path="plans" element={<PlansPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="knowledge" element={<KnowledgePage />} />
+        <Route path="materials" element={<MaterialsPage />} />
+        <Route path="growth" element={<GrowthPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/chat" replace />} />
       </Route>

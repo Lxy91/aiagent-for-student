@@ -2,12 +2,16 @@ import type {
   ChatMessage,
   Citation,
   Conversation,
+  GrowthProfile,
+  GeneratedArtifact,
   KnowledgeDocument,
   MemoryItem,
   MemoryType,
   Plan,
+  ProgressReport,
   ReasoningStep,
   TaskStatus,
+  WorkMaterial,
 } from '../types/domain';
 import { clearStoredSession, getStoredSession, type StoredSession } from './session';
 
@@ -100,6 +104,43 @@ function toPlan(item: Record<string, unknown>): Plan {
   };
 }
 
+function toMaterial(item: Record<string, unknown>): WorkMaterial {
+  const minutes = item.minutes as Record<string, unknown> | null;
+  return {
+    id: String(item.id),
+    title: String(item.title),
+    materialType: item.material_type as WorkMaterial['materialType'],
+    mimeType: String(item.mime_type),
+    sizeBytes: Number(item.size_bytes),
+    purpose: String(item.purpose),
+    status: item.status as WorkMaterial['status'],
+    privacyStatus: item.privacy_status as WorkMaterial['privacyStatus'],
+    contentExcerpt: String(item.content_excerpt ?? ''),
+    createdAt: new Date(String(item.created_at)).toLocaleString('zh-CN'),
+    minutes: minutes
+      ? {
+          id: String(minutes.id),
+          summary: String(minutes.summary),
+          actionItems: (minutes.action_items as string[]) ?? [],
+          pendingFacts: (minutes.pending_facts as string[]) ?? [],
+        }
+      : undefined,
+  };
+}
+
+function toReport(item: Record<string, unknown>): ProgressReport {
+  return {
+    id: String(item.id),
+    periodType: item.period_type as ProgressReport['periodType'],
+    periodStart: String(item.period_start),
+    periodEnd: String(item.period_end),
+    title: String(item.title),
+    sections: item.sections as Record<string, string[]>,
+    sources: (item.sources as ProgressReport['sources']) ?? [],
+    createdAt: new Date(String(item.created_at)).toLocaleString('zh-CN'),
+  };
+}
+
 export const apiClient = {
   async register(values: { email: string; password: string; displayName: string }) {
     const payload = await request<{
@@ -167,6 +208,26 @@ export const apiClient = {
           kind: ReasoningStep['kind'];
           elapsed_ms?: number;
         }>;
+        attachments: Array<{
+          id: string;
+          title: string;
+          material_type: WorkMaterial['materialType'];
+          mime_type: string;
+          status: 'ready' | 'needs_confirmation';
+        }>;
+        generated_images: Array<{
+          id: string;
+          url: string;
+          prompt: string;
+          model: string;
+        }>;
+        generated_artifacts: Array<{
+          id: string;
+          filename: string;
+          artifact_type: 'docx' | 'xlsx';
+          mime_type: string;
+          size_bytes: number;
+        }>;
       }>
     >(`/conversations/${conversationId}/messages`);
     return items.map((item) => ({
@@ -193,17 +254,40 @@ export const apiClient = {
         kind: step.kind,
         elapsedMs: Number(step.elapsed_ms ?? 0),
       })),
+      attachments: item.attachments.map((attachment) => ({
+        id: attachment.id,
+        title: attachment.title,
+        materialType: attachment.material_type,
+        mimeType: attachment.mime_type,
+        status: attachment.status,
+      })),
+      generatedImages: item.generated_images.map((image) => ({
+        id: image.id,
+        url: image.url,
+        prompt: image.prompt,
+        model: image.model,
+      })),
+      generatedArtifacts: item.generated_artifacts.map((artifact) => ({
+        id: artifact.id,
+        filename: artifact.filename,
+        artifactType: artifact.artifact_type,
+        mimeType: artifact.mime_type,
+        sizeBytes: artifact.size_bytes,
+      })),
     }));
   },
   async streamMessage(
     conversationId: string,
     content: string,
+    attachmentIds: string[],
     handlers: {
       onStarted: (id: string) => void;
       onDelta: (text: string) => void;
       onToolStarted?: (tool: string) => void;
       onToolCompleted?: (tool: string, resultCount: number) => void;
       onCitations?: (items: Citation[]) => void;
+      onImages?: (items: NonNullable<ChatMessage['generatedImages']>) => void;
+      onArtifacts?: (items: NonNullable<ChatMessage['generatedArtifacts']>) => void;
       onReasoningStep?: (step: ReasoningStep) => void;
     },
     signal: AbortSignal,
@@ -217,7 +301,7 @@ export const apiClient = {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${session?.accessToken ?? ''}`,
         },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({ content, attachment_ids: attachmentIds }),
         signal,
       },
     );
@@ -253,6 +337,25 @@ export const apiClient = {
           }));
           handlers.onCitations?.(items);
         }
+        if (event === 'images') {
+          const items = (data.items as Array<Record<string, unknown>>).map((item) => ({
+            id: String(item.id),
+            url: String(item.url),
+            prompt: String(item.prompt),
+            model: String(item.model),
+          }));
+          handlers.onImages?.(items);
+        }
+        if (event === 'artifacts') {
+          const items = (data.items as Array<Record<string, unknown>>).map((item) => ({
+            id: String(item.id),
+            filename: String(item.filename),
+            artifactType: item.artifact_type as GeneratedArtifact['artifactType'],
+            mimeType: String(item.mime_type),
+            sizeBytes: Number(item.size_bytes),
+          }));
+          handlers.onArtifacts?.(items);
+        }
         if (event === 'reasoning.step') {
           handlers.onReasoningStep?.({
             id: String(data.id),
@@ -266,6 +369,29 @@ export const apiClient = {
         if (event === 'error') throw new ApiError(String(data.message), 502, String(data.code));
       }
     }
+  },
+  async downloadArtifact(artifact: GeneratedArtifact) {
+    const session = getStoredSession();
+    const response = await fetch(`${API_BASE_URL}/artifacts/${artifact.id}/download`, {
+      headers: { Authorization: `Bearer ${session?.accessToken ?? ''}` },
+    });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+      throw new ApiError(
+        payload.error?.message ?? '文件下载失败，请稍后重试',
+        response.status,
+        payload.error?.code,
+        payload.error?.trace_id,
+      );
+    }
+    const blobUrl = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = artifact.filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(blobUrl);
   },
   async getMemories() {
     const items = await request<Array<Record<string, unknown>>>('/memories');
@@ -339,5 +465,63 @@ export const apiClient = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     });
+  },
+  async getMaterials() {
+    const items = await request<Array<Record<string, unknown>>>('/materials');
+    return items.map(toMaterial);
+  },
+  async uploadMaterial(file: File, purpose = 'meeting') {
+    const form = new FormData();
+    form.set('file', file);
+    form.set('purpose', purpose);
+    return toMaterial(
+      await request<Record<string, unknown>>('/materials', { method: 'POST', body: form }),
+    );
+  },
+  async deleteMaterial(id: string) {
+    return request<void>(`/materials/${id}`, { method: 'DELETE' });
+  },
+  async getReports() {
+    const items = await request<Array<Record<string, unknown>>>('/reports');
+    return items.map(toReport);
+  },
+  async generateReport(values: {
+    periodType: 'weekly' | 'monthly';
+    periodStart: string;
+    periodEnd: string;
+  }) {
+    return toReport(
+      await request<Record<string, unknown>>('/reports:draft', {
+        method: 'POST',
+        body: JSON.stringify({
+          period_type: values.periodType,
+          period_start: values.periodStart,
+          period_end: values.periodEnd,
+        }),
+      }),
+    );
+  },
+  async getGrowthProfile(): Promise<GrowthProfile> {
+    const payload = await request<{
+      evidence: Array<Record<string, unknown>>;
+      recommendations: Array<Record<string, unknown>>;
+    }>('/growth-profile');
+    return {
+      evidence: payload.evidence.map((item) => ({
+        id: String(item.id),
+        capability: String(item.capability),
+        summary: String(item.summary),
+        sourceType: item.source_type as 'material' | 'task' | 'feedback',
+        sourceId: String(item.source_id),
+        sourceTitle: String(item.source_title),
+        observedAt: new Date(String(item.observed_at)).toLocaleString('zh-CN'),
+      })),
+      recommendations: payload.recommendations.map((item) => ({
+        capability: String(item.capability),
+        reason: String(item.reason),
+        nextAction: String(item.next_action),
+        evidenceCount: Number(item.evidence_count),
+      })),
+    };
   },
 };

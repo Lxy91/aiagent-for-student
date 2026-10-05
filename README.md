@@ -1,8 +1,8 @@
 # 大学生职场适应智能体
 
-V0.2 全栈实现：React 前端、FastAPI 模块化单体后端，以及可审计的工具运行时。
+V0.3 全栈实现：React 前端、FastAPI 模块化单体后端、资料收件箱与可追溯成长闭环。
 
-本版本新增 DeepSeek 原生 Tool Calling、Tavily 联网搜索、来源追溯、日历事件草稿、工具目录与调用审计。联网搜索未配置时会明确返回不可用，不会伪造实时结果。
+本版本在 V0.2 工具运行时基础上新增会议录音/截图/文档/Excel 接收、隐私脱敏、纪要与行动项草稿、周报/月报草稿、能力证据和个性化学习路线。Excel 支持 XLSX、XLS 和 CSV，读取工作表、表头与有限行数作为可追溯摘要。对话支持添加图片、音频、文档和表格附件；图片附件由 GLM 视觉模型理解，明确的图片生成请求由 GLM-Image 处理，其他内容继续使用文本模型。所有派生内容保留来源；未配置对应模型能力时会明确报错，不会伪造识别结果。
 
 ## 本地开发
 
@@ -30,6 +30,8 @@ uvicorn app.main:app --reload --port 8000
 接口文档位于 <http://localhost:8000/docs>。业务数据持久化到 MySQL；未配置 DeepSeek Key 时，后端自动使用演示回复。
 
 启用联网搜索时，在 `apps/api/.env` 设置 `TAVILY_API_KEY`。对话中的时效性问题会由 DeepSeek 选择 `web.search`，前端会显示工具执行状态和可点击来源。也可通过 `GET /api/v1/tools` 查看工具目录，或调用 `POST /api/v1/tools/web.search:invoke` 进行独立验证。
+
+启用图片理解与图片生成时，在 `apps/api/.env` 设置 `BIGMODEL_API_KEY`。默认由 `glm-5v-turbo` 理解图片，由 `glm-image` 生成图片；模型名可分别通过 `BIGMODEL_VISION_MODEL` 和 `BIGMODEL_IMAGE_MODEL` 调整。
 
 ## 质量检查
 

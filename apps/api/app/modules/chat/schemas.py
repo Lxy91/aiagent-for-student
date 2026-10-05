@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class CreateConversationRequest(BaseModel):
@@ -26,7 +26,40 @@ class UpdateConversationRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    content: str = Field(min_length=1, max_length=10_000)
+    content: str = Field(default="", max_length=10_000)
+    attachment_ids: list[UUID] = Field(default_factory=list, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_input(self) -> "SendMessageRequest":
+        self.content = self.content.strip()
+        if not self.content and not self.attachment_ids:
+            raise ValueError("message content or attachment is required")
+        if len(set(self.attachment_ids)) != len(self.attachment_ids):
+            raise ValueError("attachment ids must be unique")
+        return self
+
+
+class MessageAttachmentResponse(BaseModel):
+    id: UUID
+    title: str
+    material_type: Literal["audio", "image", "document", "spreadsheet", "text"]
+    mime_type: str
+    status: Literal["ready", "needs_confirmation"]
+
+
+class GeneratedImageResponse(BaseModel):
+    id: str
+    url: str
+    prompt: str
+    model: str
+
+
+class GeneratedArtifactResponse(BaseModel):
+    id: str
+    filename: str
+    artifact_type: Literal["docx", "xlsx"]
+    mime_type: str
+    size_bytes: int
 
 
 class CitationResponse(BaseModel):
@@ -55,3 +88,6 @@ class MessageResponse(BaseModel):
     created_at: datetime
     citations: list[CitationResponse] = Field(default_factory=list)
     reasoning_steps: list[ReasoningStepResponse] = Field(default_factory=list)
+    attachments: list[MessageAttachmentResponse] = Field(default_factory=list)
+    generated_images: list[GeneratedImageResponse] = Field(default_factory=list)
+    generated_artifacts: list[GeneratedArtifactResponse] = Field(default_factory=list)

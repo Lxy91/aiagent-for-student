@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "大学生职场适应智能体 API"
-    app_version: str = "0.2.0"
+    app_version: str = "0.3.0"
     app_env: str = "development"
     app_secret_key: str = "development-only-change-me"
     app_cors_origins: Annotated[list[str], NoDecode] = Field(
@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_timeout_seconds: float = 60.0
     demo_mode: bool = True
+
+    bigmodel_api_key: str | None = None
+    bigmodel_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    bigmodel_vision_model: str = "glm-5v-turbo"
+    bigmodel_image_model: str = "glm-image"
+    bigmodel_timeout_seconds: float = 120.0
 
     web_search_provider: str = "tavily"
     web_search_enabled: bool = True
@@ -58,6 +64,10 @@ class Settings(BaseSettings):
     @property
     def deepseek_enabled(self) -> bool:
         return bool(self.deepseek_api_key) and not self.demo_mode
+
+    @property
+    def bigmodel_enabled(self) -> bool:
+        return bool(self.bigmodel_api_key) and not self.demo_mode
 
     @property
     def online_search_available(self) -> bool:

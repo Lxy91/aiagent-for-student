@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -8,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
-from app.infrastructure.db.models import ConversationModel, MessageModel
+from app.infrastructure.db.models import ConversationModel, MessageModel, WorkMaterialModel
 from app.infrastructure.llm.deepseek import DeepSeekProvider
 from app.modules.chat.schemas import (
     ConversationResponse,
@@ -228,6 +229,67 @@ class ConversationService:
         await self.session.commit()
         return item
 
+    async def resolve_attachments(
+        self, user_id: UUID, attachment_ids: list[UUID]
+    ) -> tuple[list[dict[str, str]], str, list[dict[str, str]]]:
+        if not attachment_ids:
+            return [], "", []
+        requested = [str(item) for item in attachment_ids]
+        result = await self.session.scalars(
+            select(WorkMaterialModel).where(
+                WorkMaterialModel.user_id == str(user_id),
+                WorkMaterialModel.id.in_(requested),
+            )
+        )
+        by_id = {item.id: item for item in result}
+        if len(by_id) != len(requested):
+            raise AppError("ATTACHMENT_NOT_FOUND", "部分附件不存在或无权访问", status_code=404)
+
+        attachments: list[dict[str, str]] = []
+        context_sections: list[str] = []
+        vision_images: list[dict[str, str]] = []
+        for material_id in requested:
+            item = by_id[material_id]
+            if item.status == "blocked":
+                raise AppError(
+                    "ATTACHMENT_REVIEW_REQUIRED",
+                    f"附件“{item.title}”包含高风险隐私信息，请先处理后再发送",
+                    status_code=422,
+                )
+            attachments.append(
+                {
+                    "id": item.id,
+                    "title": item.title,
+                    "material_type": item.material_type,
+                    "mime_type": item.mime_type,
+                    "status": item.status,
+                }
+            )
+            if item.material_type == "image" and item.binary_content:
+                vision_images.append(
+                    {
+                        "id": item.id,
+                        "title": item.title,
+                        "mime_type": item.mime_type,
+                        "base64": base64.b64encode(item.binary_content).decode("ascii"),
+                    }
+                )
+            if item.material_type == "image" and item.binary_content:
+                context_sections.append(
+                    f"[附件：{item.title}；类型：image；图片内容已作为视觉输入提供]"
+                )
+            elif item.extracted_text or item.content_excerpt:
+                context_sections.append(
+                    f"[附件：{item.title}；类型：{item.material_type}]\n"
+                    f"{item.extracted_text or item.content_excerpt}"
+                )
+            else:
+                context_sections.append(
+                    f"[附件：{item.title}；类型：{item.material_type}；"
+                    "当前未提取到可供模型读取的文字内容，请勿推测附件内容]"
+                )
+        return attachments, "\n\n".join(context_sections), vision_images
+
     async def recent_messages(self, conversation_id: UUID, limit: int = 12) -> list[dict[str, str]]:
         result = await self.session.scalars(
             select(MessageModel)
@@ -243,11 +305,88 @@ class ConversationService:
                 "content": (
                     sanitize_assistant_content(item.content)
                     if item.role == "assistant"
-                    else item.content
+                    else "\n\n".join(
+                        part
+                        for part in (
+                            item.content,
+                            (item.metadata_json or {}).get("attachment_context", ""),
+                        )
+                        if part
+                    )
                 ),
             }
             for item in items
         ]
+
+    async def pending_attachment_edit(self, conversation_id: UUID) -> dict[str, str] | None:
+        result = await self.session.scalars(
+            select(MessageModel)
+            .where(MessageModel.conversation_id == str(conversation_id))
+            .order_by(MessageModel.created_at.desc())
+            .limit(12)
+        )
+        recent = list(result)
+        latest = recent[0] if recent else None
+        if latest is None or latest.role != "assistant":
+            return None
+        pending = (latest.metadata_json or {}).get("pending_attachment_edit")
+        if isinstance(pending, dict) and pending.get("attachment_id"):
+            return {
+                "attachment_id": str(pending["attachment_id"]),
+                "filename": str(pending.get("filename") or "附件"),
+                "original_request": str(pending.get("original_request") or "补全附件"),
+            }
+
+        legacy_resume_markers = (
+            "请补充",
+            "暂无法填写",
+            "已保持空白",
+            "无法直接修改并返回",
+            "无法直接生成",
+            "复制并粘贴",
+        )
+        if not any(marker in latest.content for marker in legacy_resume_markers):
+            return None
+        for item in recent:
+            metadata = item.metadata_json or {}
+            if metadata.get("generated_artifacts"):
+                return None
+            if item.role != "user":
+                continue
+            editable = [
+                attachment
+                for attachment in metadata.get("attachments", [])
+                if str(attachment.get("title") or "").lower().endswith((".docx", ".xlsx"))
+            ]
+            if len(editable) == 1:
+                attachment = editable[0]
+                return {
+                    "attachment_id": str(attachment["id"]),
+                    "filename": str(attachment.get("title") or "附件"),
+                    "original_request": item.content or "补全附件",
+                }
+        return None
+
+    async def latest_generated_artifact(self, conversation_id: UUID) -> dict[str, str] | None:
+        result = await self.session.scalars(
+            select(MessageModel)
+            .where(MessageModel.conversation_id == str(conversation_id))
+            .order_by(MessageModel.created_at.desc())
+            .limit(20)
+        )
+        for item in result:
+            artifacts = (item.metadata_json or {}).get("generated_artifacts", [])
+            for artifact in reversed(artifacts):
+                filename = str(artifact.get("filename") or "")
+                if filename.lower().endswith((".docx", ".xlsx")) and artifact.get("id"):
+                    return {
+                        "id": str(artifact["id"]),
+                        "title": filename,
+                        "material_type": "document",
+                        "mime_type": str(artifact.get("mime_type") or ""),
+                        "status": "ready",
+                    }
+        return None
 
     async def list_messages(self, user_id: UUID, conversation_id: UUID) -> list[MessageResponse]:
         await self.get_owned(user_id, conversation_id)
@@ -269,6 +408,9 @@ class ConversationService:
                 created_at=item.created_at,
                 citations=(item.metadata_json or {}).get("citations", []),
                 reasoning_steps=(item.metadata_json or {}).get("reasoning_steps", []),
+                attachments=(item.metadata_json or {}).get("attachments", []),
+                generated_images=(item.metadata_json or {}).get("generated_images", []),
+                generated_artifacts=(item.metadata_json or {}).get("generated_artifacts", []),
             )
             for item in result
         ]

@@ -1,6 +1,18 @@
 from datetime import UTC, date, datetime
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+)
+from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infrastructure.db.base import Base
@@ -48,6 +60,27 @@ class MessageModel(Base):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     conversation: Mapped[ConversationModel] = relationship(back_populates="messages")
+
+
+class GeneratedArtifactModel(Base):
+    __tablename__ = "generated_artifacts"
+    __table_args__ = (
+        Index("ix_generated_artifacts_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(String(255))
+    artifact_type: Mapped[str] = mapped_column(String(20), index=True)
+    mime_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    binary_content: Mapped[bytes] = mapped_column(
+        LargeBinary().with_variant(LONGBLOB(), "mysql")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
 
 
 class MemoryCandidateModel(Base):
@@ -255,3 +288,68 @@ class ToolRunModel(Base):
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WorkMaterialModel(Base):
+    __tablename__ = "work_materials"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    material_type: Mapped[str] = mapped_column(String(20), index=True)
+    mime_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    purpose: Mapped[str] = mapped_column(String(40), default="reference")
+    status: Mapped[str] = mapped_column(String(30), default="ready", index=True)
+    privacy_status: Mapped[str] = mapped_column(String(30), default="clear")
+    content_excerpt: Mapped[str] = mapped_column(Text, default="")
+    extracted_text: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"), default=""
+    )
+    binary_content: Mapped[bytes | None] = mapped_column(
+        LargeBinary().with_variant(LONGBLOB(), "mysql"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
+
+
+class MeetingMinutesModel(Base):
+    __tablename__ = "meeting_minutes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    source_material_id: Mapped[str] = mapped_column(
+        ForeignKey("work_materials.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    summary: Mapped[str] = mapped_column(Text)
+    action_items: Mapped[list] = mapped_column(JSON, default=list)
+    pending_facts: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+
+
+class GrowthEvidenceModel(Base):
+    __tablename__ = "growth_evidence"
+    __table_args__ = (Index("ix_growth_evidence_user_created", "user_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    summary: Mapped[str] = mapped_column(String(1000))
+    source_type: Mapped[str] = mapped_column(String(30))
+    source_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_title: Mapped[str] = mapped_column(String(255))
+    observed_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+
+
+class ProgressReportModel(Base):
+    __tablename__ = "progress_reports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    period_type: Mapped[str] = mapped_column(String(20))
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    title: Mapped[str] = mapped_column(String(200))
+    sections: Mapped[dict] = mapped_column(JSON)
+    source_refs: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)

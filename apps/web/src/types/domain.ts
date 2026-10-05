@@ -25,6 +25,32 @@ export interface ChatMessage {
   createdAt: string;
   citations?: Citation[];
   reasoningSteps?: ReasoningStep[];
+  attachments?: ChatAttachment[];
+  generatedImages?: GeneratedImage[];
+  generatedArtifacts?: GeneratedArtifact[];
+}
+
+export interface ChatAttachment {
+  id: string;
+  title: string;
+  materialType: MaterialType;
+  mimeType: string;
+  status: 'ready' | 'needs_confirmation';
+}
+
+export interface GeneratedImage {
+  id: string;
+  url: string;
+  prompt: string;
+  model: string;
+}
+
+export interface GeneratedArtifact {
+  id: string;
+  filename: string;
+  artifactType: 'docx' | 'xlsx';
+  mimeType: string;
+  sizeBytes: number;
 }
 
 export interface Conversation {
@@ -81,4 +107,67 @@ export interface KnowledgeDocument {
   status: DocumentStatus;
   chunks: number;
   updatedAt: string;
+}
+
+export type MaterialType = 'audio' | 'image' | 'document' | 'spreadsheet' | 'text';
+export type MaterialStatus = 'ready' | 'needs_confirmation' | 'blocked';
+
+export interface MeetingMinutes {
+  id: string;
+  summary: string;
+  actionItems: string[];
+  pendingFacts: string[];
+}
+
+export interface WorkMaterial {
+  id: string;
+  title: string;
+  materialType: MaterialType;
+  mimeType: string;
+  sizeBytes: number;
+  purpose: string;
+  status: MaterialStatus;
+  privacyStatus: 'clear' | 'redacted' | 'review_required';
+  contentExcerpt: string;
+  createdAt: string;
+  minutes?: MeetingMinutes;
+}
+
+export interface SourceReference {
+  type: 'task' | 'material';
+  id: string;
+  title: string;
+}
+
+export interface ProgressReport {
+  id: string;
+  periodType: 'weekly' | 'monthly';
+  periodStart: string;
+  periodEnd: string;
+  title: string;
+  sections: Record<string, string[]>;
+  sources: SourceReference[];
+  createdAt: string;
+}
+
+export interface GrowthEvidence {
+  id: string;
+  capability: string;
+  summary: string;
+  sourceType: 'material' | 'task' | 'feedback';
+  sourceId: string;
+  sourceTitle: string;
+  observedAt: string;
+}
+
+export interface LearningRecommendation {
+  capability: string;
+  reason: string;
+  nextAction: string;
+  evidenceCount: number;
+}
+
+export interface GrowthProfile {
+  evidence: GrowthEvidence[];
+  recommendations: LearningRecommendation[];
 }
