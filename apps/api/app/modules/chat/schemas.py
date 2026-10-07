@@ -19,6 +19,14 @@ class ConversationResponse(BaseModel):
     created_at: datetime
 
 
+class ConversationContextResponse(BaseModel):
+    message_count: int = Field(ge=0)
+    estimated_tokens: int = Field(ge=0)
+    token_budget: int = Field(gt=0)
+    trimmed_count: int = Field(default=0, ge=0)
+    compressed_at: datetime | None = None
+
+
 class UpdateConversationRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=100)
     is_pinned: bool | None = None
@@ -80,6 +88,13 @@ class ReasoningStepResponse(BaseModel):
     elapsed_ms: int = Field(default=0, ge=0)
 
 
+class TokenUsageResponse(BaseModel):
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+    estimated: bool = False
+
+
 class MessageResponse(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -91,3 +106,4 @@ class MessageResponse(BaseModel):
     attachments: list[MessageAttachmentResponse] = Field(default_factory=list)
     generated_images: list[GeneratedImageResponse] = Field(default_factory=list)
     generated_artifacts: list[GeneratedArtifactResponse] = Field(default_factory=list)
+    token_usage: TokenUsageResponse | None = None

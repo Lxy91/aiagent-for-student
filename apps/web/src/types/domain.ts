@@ -28,6 +28,14 @@ export interface ChatMessage {
   attachments?: ChatAttachment[];
   generatedImages?: GeneratedImage[];
   generatedArtifacts?: GeneratedArtifact[];
+  tokenUsage?: TokenUsage;
+}
+
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimated: boolean;
 }
 
 export interface ChatAttachment {
@@ -60,6 +68,14 @@ export interface Conversation {
   is_pinned: boolean;
   is_archived: boolean;
   created_at: string;
+}
+
+export interface ConversationContext {
+  messageCount: number;
+  estimatedTokens: number;
+  tokenBudget: number;
+  trimmedCount: number;
+  compressedAt?: string;
 }
 
 export type MemoryType = 'profile' | 'preference' | 'goal' | 'experience';

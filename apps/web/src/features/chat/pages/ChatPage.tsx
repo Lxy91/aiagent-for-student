@@ -33,6 +33,8 @@ import {
   Dropdown,
   Input,
   Modal,
+  Popconfirm,
+  Progress,
   Segmented,
   Space,
   Tag,
@@ -50,6 +52,7 @@ import { apiClient } from '../../../services/api-client';
 import type {
   ChatMessage,
   Conversation,
+  ConversationContext,
   GeneratedArtifact,
   MaterialType,
   ReasoningStep,
@@ -213,6 +216,21 @@ export function ChatPage() {
     enabled: Boolean(conversationId),
     staleTime: Number.POSITIVE_INFINITY,
   });
+  const conversationContext = useQuery({
+    queryKey: ['conversation-context', conversationId],
+    queryFn: () => apiClient.getConversationContext(conversationId!),
+    enabled: Boolean(conversationId),
+  });
+  const compressContext = useMutation({
+    mutationFn: (id: string) => apiClient.compressConversationContext(id),
+    onSuccess: (context, id) => {
+      queryClient.setQueryData(['conversation-context', id], context);
+      message.success('上下文已压缩为摘要，聊天记录仍会保留');
+    },
+    onError: (error) => {
+      message.error(error instanceof Error ? error.message : '上下文压缩失败');
+    },
+  });
 
   useEffect(() => {
     if (!conversationId && conversations.data?.length) {
@@ -322,6 +340,7 @@ export function ChatPage() {
     const controller = new AbortController();
     generationControllersRef.current.set(targetId, controller);
     setGenerations((items) => ({ ...items, [targetId]: { assistantId } }));
+    let streamedText = '';
     try {
       await apiClient.streamMessage(
         targetId,
@@ -331,12 +350,14 @@ export function ChatPage() {
           onStarted: () => {
             void queryClient.invalidateQueries({ queryKey: ['conversations'] });
           },
-          onDelta: (text) =>
+          onDelta: (text) => {
+            streamedText += text;
             updateCachedMessages(targetId, (items) =>
               items.map((item) =>
                 item.id === assistantId ? { ...item, content: item.content + text } : item,
               ),
-            ),
+            );
+          },
           onToolStarted: (tool) =>
             updateGenerationStatus(
               targetId,
@@ -374,14 +395,34 @@ export function ChatPage() {
                 return { ...item, reasoningSteps };
               }),
             ),
+          onContextUsage: (context) =>
+            queryClient.setQueryData<ConversationContext>(
+              ['conversation-context', targetId],
+              context,
+            ),
         },
         controller.signal,
       );
       await queryClient.invalidateQueries({ queryKey: ['messages', targetId] });
+      await queryClient.invalidateQueries({ queryKey: ['conversation-context', targetId] });
     } catch (error) {
       if (!controller.signal.aborted) {
-        message.error(error instanceof Error ? error.message : '消息发送失败');
-        updateCachedMessages(targetId, (items) => items.filter((item) => item.id !== assistantId));
+        if (streamedText) {
+          message.warning('连接中断，已保留已经生成的内容');
+          updateCachedMessages(targetId, (items) =>
+            items.map((item) =>
+              item.id === assistantId
+                ? {
+                    ...item,
+                    content: `${item.content}\n\n> 连接中断，已保留已经生成的内容，可以继续提问。`,
+                  }
+                : item,
+            ),
+          );
+        } else {
+          message.error(error instanceof Error ? error.message : '消息发送失败');
+          updateCachedMessages(targetId, (items) => items.filter((item) => item.id !== assistantId));
+        }
       }
     } finally {
       if (generationControllersRef.current.get(targetId) === controller) {
@@ -514,11 +555,54 @@ export function ChatPage() {
             <h1>{selectedConversation?.title ?? '新对话'}</h1>
             <span>V0.3 · 可追溯资料与成长闭环</span>
           </div>
-          <Segmented
-            className="chat-mode-switch"
-            options={['标准对话', '临时对话']}
-            size="small"
-          />
+          <div className="chat-toolbar-actions">
+            {conversationId ? (
+              <Popconfirm
+                title="压缩当前上下文？"
+                description="旧内容会整理成摘要，聊天记录保持不变。"
+                okText="压缩"
+                cancelText="取消"
+                onConfirm={() => compressContext.mutate(conversationId)}
+              >
+                <Tooltip title="点击压缩上下文">
+                  <Button
+                    type="text"
+                    className="context-meter"
+                    loading={compressContext.isPending}
+                    aria-label="查看并压缩当前上下文"
+                  >
+                    <Progress
+                      type="circle"
+                      size={38}
+                      percent={Math.min(
+                        100,
+                        Math.round(
+                          ((conversationContext.data?.estimatedTokens ?? 0) /
+                            Math.max(1, conversationContext.data?.tokenBudget ?? 1)) *
+                            100,
+                        ),
+                      )}
+                      strokeColor="#287565"
+                      railColor="#dce7e1"
+                      format={(percent) => `${percent ?? 0}%`}
+                    />
+                    <span className="context-meter-copy">
+                      <strong>上下文</strong>
+                      <small>
+                        {(conversationContext.data?.estimatedTokens ?? 0).toLocaleString()} /{' '}
+                        {(conversationContext.data?.tokenBudget ?? 0).toLocaleString()}
+                      </small>
+                    </span>
+                  </Button>
+                </Tooltip>
+              </Popconfirm>
+            ) : null}
+            <Segmented
+              className="chat-mode-switch"
+              options={['标准对话', '临时对话']}
+              size="small"
+            />
+          </div>
         </div>
 
         <StateCard

@@ -11,6 +11,17 @@ from app.core.errors import AppError
 class DeepSeekProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _record_usage(self, usage: dict[str, Any] | None) -> None:
+        if not usage:
+            return
+        for key in self.token_usage:
+            self.token_usage[key] += int(usage.get(key) or 0)
 
     async def stream_chat(self, messages: Sequence[dict[str, Any]]) -> AsyncIterator[str]:
         if not self.settings.deepseek_enabled:
@@ -28,6 +39,8 @@ class DeepSeekProvider:
             "messages": list(messages),
             "thinking": {"type": "disabled"},
             "stream": True,
+            "stream_options": {"include_usage": True},
+            "max_tokens": self.settings.chat_completion_max_tokens,
         }
         timeout = httpx.Timeout(self.settings.deepseek_timeout_seconds, connect=10.0)
         try:
@@ -51,6 +64,7 @@ class DeepSeekProvider:
                     if data == "[DONE]":
                         break
                     chunk = json.loads(data)
+                    self._record_usage(chunk.get("usage"))
                     content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
                     if content:
                         yield content
@@ -112,6 +126,7 @@ class DeepSeekProvider:
                     retryable=response.status_code in {408, 429, 500, 502, 503, 504},
                 )
             body = response.json()
+            self._record_usage(body.get("usage"))
             message = body.get("choices", [{}])[0].get("message") or {}
             calls = message.get("tool_calls") or []
             return message or None, calls
@@ -156,7 +171,9 @@ class DeepSeekProvider:
                     details=[{"provider_status": response.status_code}],
                     retryable=response.status_code in {408, 429, 500, 502, 503, 504},
                 )
-            content = response.json().get("choices", [{}])[0].get("message", {}).get("content")
+            body = response.json()
+            self._record_usage(body.get("usage"))
+            content = body.get("choices", [{}])[0].get("message", {}).get("content")
             if not content:
                 raise AppError(
                     "MODEL_EMPTY_RESPONSE", "模型未返回计划内容", status_code=502, retryable=True

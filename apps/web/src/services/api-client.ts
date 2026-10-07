@@ -2,6 +2,7 @@ import type {
   ChatMessage,
   Citation,
   Conversation,
+  ConversationContext,
   GrowthProfile,
   GeneratedArtifact,
   KnowledgeDocument,
@@ -185,6 +186,38 @@ export const apiClient = {
       body: JSON.stringify(changes),
     });
   },
+  async getConversationContext(conversationId: string): Promise<ConversationContext> {
+    const item = await request<{
+      message_count: number;
+      estimated_tokens: number;
+      token_budget: number;
+      trimmed_count: number;
+      compressed_at?: string;
+    }>(`/conversations/${conversationId}/context`);
+    return {
+      messageCount: item.message_count,
+      estimatedTokens: item.estimated_tokens,
+      tokenBudget: item.token_budget,
+      trimmedCount: item.trimmed_count,
+      compressedAt: item.compressed_at,
+    };
+  },
+  async compressConversationContext(conversationId: string): Promise<ConversationContext> {
+    const item = await request<{
+      message_count: number;
+      estimated_tokens: number;
+      token_budget: number;
+      trimmed_count: number;
+      compressed_at?: string;
+    }>(`/conversations/${conversationId}/context:compress`, { method: 'POST' });
+    return {
+      messageCount: item.message_count,
+      estimatedTokens: item.estimated_tokens,
+      tokenBudget: item.token_budget,
+      trimmedCount: item.trimmed_count,
+      compressedAt: item.compressed_at,
+    };
+  },
   async getMessages(conversationId: string): Promise<ChatMessage[]> {
     const items = await request<
       Array<{
@@ -228,6 +261,12 @@ export const apiClient = {
           mime_type: string;
           size_bytes: number;
         }>;
+        token_usage?: {
+          prompt_tokens: number;
+          completion_tokens: number;
+          total_tokens: number;
+          estimated?: boolean;
+        } | null;
       }>
     >(`/conversations/${conversationId}/messages`);
     return items.map((item) => ({
@@ -274,6 +313,14 @@ export const apiClient = {
         mimeType: artifact.mime_type,
         sizeBytes: artifact.size_bytes,
       })),
+      tokenUsage: item.token_usage
+        ? {
+            promptTokens: Number(item.token_usage.prompt_tokens),
+            completionTokens: Number(item.token_usage.completion_tokens),
+            totalTokens: Number(item.token_usage.total_tokens),
+            estimated: Boolean(item.token_usage.estimated),
+          }
+        : undefined,
     }));
   },
   async streamMessage(
@@ -289,6 +336,8 @@ export const apiClient = {
       onImages?: (items: NonNullable<ChatMessage['generatedImages']>) => void;
       onArtifacts?: (items: NonNullable<ChatMessage['generatedArtifacts']>) => void;
       onReasoningStep?: (step: ReasoningStep) => void;
+      onContextUsage?: (context: ConversationContext) => void;
+      onUsage?: (usage: NonNullable<ChatMessage['tokenUsage']>) => void;
     },
     signal: AbortSignal,
   ) {
@@ -321,6 +370,29 @@ export const apiClient = {
         if (!event || !dataText) continue;
         const data = JSON.parse(dataText) as Record<string, unknown>;
         if (event === 'message.started') handlers.onStarted(String(data.message_id));
+        if (event === 'context.usage') {
+          const context = {
+            messageCount: Number(data.message_count ?? 0),
+            estimatedTokens: Number(data.estimated_tokens ?? 0),
+            tokenBudget: Number(data.token_budget ?? 0),
+            trimmedCount: Number(data.trimmed_count ?? 0),
+          };
+          console.info('[Context Debug]', context);
+          handlers.onContextUsage?.(context);
+        }
+        if (event === 'context.prompt_debug') {
+          const breakdown = data.breakdown as Record<string, unknown>;
+          console.groupCollapsed('[Prompt Debug] 本轮发送给 AI 的提示词');
+          console.info('Token 构成', {
+            databaseHistoryTokens: Number(breakdown.database_history_tokens ?? 0),
+            compressedSummaryTokens: Number(breakdown.compressed_summary_tokens ?? 0),
+            currentInputTokens: Number(breakdown.current_input_tokens ?? 0),
+            systemPromptTokens: Number(breakdown.system_prompt_tokens ?? 0),
+            totalPromptTokens: Number(breakdown.total_prompt_tokens ?? 0),
+          });
+          console.info('完整提示词消息', data.messages);
+          console.groupEnd();
+        }
         if (event === 'message.delta') handlers.onDelta(String(data.text));
         if (event === 'tool.started') handlers.onToolStarted?.(String(data.tool));
         if (event === 'tool.completed') {
@@ -364,6 +436,21 @@ export const apiClient = {
             status: data.status as ReasoningStep['status'],
             kind: data.kind as ReasoningStep['kind'],
             elapsedMs: Number(data.elapsed_ms ?? 0),
+          });
+        }
+        if ((event === 'usage.updated' || event === 'message.completed') && data.usage) {
+          const usage = data.usage as Record<string, unknown>;
+          console.info('[Token Usage]', {
+            promptTokens: Number(usage.prompt_tokens ?? 0),
+            completionTokens: Number(usage.completion_tokens ?? 0),
+            totalTokens: Number(usage.total_tokens ?? 0),
+            estimated: Boolean(usage.estimated),
+          });
+          handlers.onUsage?.({
+            promptTokens: Number(usage.prompt_tokens ?? 0),
+            completionTokens: Number(usage.completion_tokens ?? 0),
+            totalTokens: Number(usage.total_tokens ?? 0),
+            estimated: Boolean(usage.estimated),
           });
         }
         if (event === 'error') throw new ApiError(String(data.message), 502, String(data.code));

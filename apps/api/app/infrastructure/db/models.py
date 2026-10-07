@@ -41,6 +41,9 @@ class ConversationModel(Base):
     mode: Mapped[str] = mapped_column(String(20), default="standard")
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    context_cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    context_summary: Mapped[str] = mapped_column(Text, default="")
+    context_clear_notice_pending: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
     messages: Mapped[list["MessageModel"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
@@ -57,6 +60,7 @@ class MessageModel(Base):
     )
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
+    sanitized_content: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     conversation: Mapped[ConversationModel] = relationship(back_populates="messages")

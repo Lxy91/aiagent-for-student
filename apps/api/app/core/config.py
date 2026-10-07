@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     deepseek_timeout_seconds: float = 60.0
     demo_mode: bool = True
 
+    # Estimated-token budget reserved for persisted conversation history. The
+    # current message is always retained even when it alone exceeds this value.
+    chat_history_token_budget: int = Field(default=12_000, ge=256, le=1_000_000)
+    chat_attachment_token_budget: int = Field(default=6_000, ge=256, le=100_000)
+    chat_completion_max_tokens: int = Field(default=4_000, ge=256, le=32_000)
+
     bigmodel_api_key: str | None = None
     bigmodel_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     bigmodel_vision_model: str = "glm-5v-turbo"

@@ -27,7 +27,9 @@ from app.modules.artifacts.service import (
     artifact_generation_instruction,
     requested_artifact_types,
 )
+from app.modules.chat.context import sanitize_tool_result
 from app.modules.chat.schemas import (
+    ConversationContextResponse,
     ConversationResponse,
     CreateConversationRequest,
     MessageResponse,
@@ -38,6 +40,8 @@ from app.modules.chat.service import (
     ConversationService,
     ExecutionNarrative,
     build_execution_narrative,
+    estimate_message_tokens,
+    estimate_text_tokens,
     sanitize_assistant_content,
 )
 from app.tools.contracts import ToolContext
@@ -94,6 +98,25 @@ PENDING_EDIT_CANCEL_MARKERS = ("算了", "不用了", "取消", "不处理了", 
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+def resolved_token_usage(
+    messages: list[dict], response: str, *provider_usages: dict[str, int]
+) -> dict[str, int | bool]:
+    usage = {
+        key: sum(int(item.get(key) or 0) for item in provider_usages)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+    if usage["total_tokens"]:
+        return {**usage, "estimated": False}
+    prompt_tokens = estimate_text_tokens(json.dumps(messages, ensure_ascii=False, default=str))
+    completion_tokens = estimate_text_tokens(response)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "estimated": True,
+    }
 
 
 def requires_web_search(content: str) -> bool:
@@ -221,6 +244,49 @@ async def list_messages(
     return await ConversationService(session).list_messages(current_user.id, conversation_id)
 
 
+@router.get("/{conversation_id}/context", response_model=ConversationContextResponse)
+async def get_conversation_context(
+    conversation_id: UUID,
+    current_user: CurrentUserDep,
+    settings: SettingsDep,
+    session: SessionDep,
+) -> ConversationContextResponse:
+    service = ConversationService(session)
+    conversation = await service.get_owned(current_user.id, conversation_id)
+    window = await service.context_window(
+        conversation_id, token_budget=settings.chat_history_token_budget
+    )
+    return ConversationContextResponse(
+        message_count=window.message_count,
+        estimated_tokens=window.estimated_tokens,
+        token_budget=settings.chat_history_token_budget,
+        trimmed_count=window.trimmed_count,
+        compressed_at=conversation.context_cleared_at,
+    )
+
+
+@router.post("/{conversation_id}/context:compress", response_model=ConversationContextResponse)
+async def compress_conversation_context(
+    conversation_id: UUID,
+    current_user: CurrentUserDep,
+    settings: SettingsDep,
+    session: SessionDep,
+) -> ConversationContextResponse:
+    service = ConversationService(session)
+    conversation = await service.compress_context(
+        current_user.id, conversation_id
+    )
+    window = await service.context_window(
+        conversation_id, token_budget=settings.chat_history_token_budget
+    )
+    return ConversationContextResponse(
+        message_count=window.message_count,
+        estimated_tokens=window.estimated_tokens,
+        token_budget=settings.chat_history_token_budget,
+        compressed_at=conversation.context_cleared_at,
+    )
+
+
 @router.post("/{conversation_id}/messages:stream")
 async def stream_message(
     conversation_id: UUID,
@@ -231,7 +297,7 @@ async def stream_message(
     session: SessionDep,
 ) -> StreamingResponse:
     service = ConversationService(session)
-    await service.get_owned(current_user.id, conversation_id)
+    await service.get_writable(current_user.id, conversation_id)
     pending_edit = None
     generated_edit = None
     attachment_ids = payload.attachment_ids
@@ -244,7 +310,9 @@ async def stream_message(
             if candidate and editable_attachments(payload.content, [candidate]):
                 generated_edit = candidate
     attachments, attachment_context, vision_images = await service.resolve_attachments(
-        current_user.id, attachment_ids
+        current_user.id,
+        attachment_ids,
+        token_budget=settings.chat_attachment_token_budget,
     )
     title_source = payload.content or "、".join(item["title"] for item in attachments)
     await service.apply_first_message_title(current_user.id, conversation_id, title_source)
@@ -260,8 +328,54 @@ async def stream_message(
     async def event_stream() -> AsyncIterator[str]:
         started_at = perf_counter()
         response_id = uuid4()
+        reasoning_steps: list[dict] = []
         yield sse("message.started", {"message_id": response_id, "trace_id": trace_id})
-        history = await service.recent_messages(conversation_id)
+        context_window = await service.context_window(
+            conversation_id, token_budget=settings.chat_history_token_budget
+        )
+        history = context_window.messages
+        yield sse(
+            "context.usage",
+            {
+                "message_count": context_window.message_count,
+                "estimated_tokens": context_window.estimated_tokens,
+                "token_budget": settings.chat_history_token_budget,
+                "trimmed_count": context_window.trimmed_count,
+            },
+        )
+        cleanup_detail = ""
+        if await service.consume_context_clear_notice(conversation_id):
+            cleanup_detail = "已按你的操作将此前对话压缩为摘要，本轮会继续参考摘要内容。"
+        elif context_window.trimmed_count:
+            await service.persist_context_compression(
+                conversation_id, oldest_included_at=context_window.oldest_included_at
+            )
+            cleanup_detail = (
+                f"对话较长，已自动压缩 {context_window.trimmed_count} 条较早消息，"
+                f"保留最近 {context_window.message_count} 条继续处理。"
+            )
+        if cleanup_detail:
+            cleanup_step = {
+                "id": "context-cleanup",
+                "title": "上下文整理",
+                "detail": cleanup_detail,
+                "status": "completed",
+                "kind": "analysis",
+                "elapsed_ms": int((perf_counter() - started_at) * 1000),
+            }
+            reasoning_steps.append(cleanup_step)
+            yield sse("reasoning.step", cleanup_step)
+        if "附件内容过长，已按上下文预算截取" in attachment_context:
+            attachment_step = {
+                "id": "attachment-context-limit",
+                "title": "附件内容整理",
+                "detail": "附件正文较长，已按上下文预算保留开头和结尾，避免生成过程中断。",
+                "status": "completed",
+                "kind": "analysis",
+                "elapsed_ms": int((perf_counter() - started_at) * 1000),
+            }
+            reasoning_steps.append(attachment_step)
+            yield sse("reasoning.step", attachment_step)
         artifact_types = requested_artifact_types(payload.content)
         artifact_instruction = artifact_generation_instruction(payload.content)
         messages: list[dict] = [
@@ -281,9 +395,24 @@ async def stream_message(
             },
             *history,
         ]
+        system_tokens = estimate_message_tokens(messages[0])
+        yield sse(
+            "context.prompt_debug",
+            {
+                "messages": messages,
+                "breakdown": {
+                    "system_prompt_tokens": system_tokens,
+                    "database_history_tokens": context_window.database_history_tokens,
+                    "compressed_summary_tokens": context_window.summary_tokens,
+                    "current_input_tokens": context_window.current_input_tokens,
+                    "total_prompt_tokens": sum(
+                        estimate_message_tokens(message) for message in messages
+                    ),
+                },
+            },
+        )
         full_response = ""
         citations: list[dict] = []
-        reasoning_steps: list[dict] = []
         observations: list[str] = []
         tool_call_count = 0
         last_plan_step: dict | None = None
@@ -557,6 +686,11 @@ async def stream_message(
                         iteration=iteration,
                     )
                 )
+                if provider.token_usage["total_tokens"]:
+                    yield sse(
+                        "usage.updated",
+                        {"usage": {**provider.token_usage, "estimated": False}},
+                    )
                 if iteration == 0 and attachments:
                     understanding, next_action = attachment_execution_summary(
                         payload.content, attachments, vision_images
@@ -687,7 +821,7 @@ async def stream_message(
                         {
                             "role": "tool",
                             "tool_call_id": call.get("id"),
-                            "content": json.dumps(result_payload, ensure_ascii=False),
+                            "content": sanitize_tool_result(definition.name, result_payload),
                         }
                     )
 
@@ -711,6 +845,9 @@ async def stream_message(
             full_response = sanitize_assistant_content(full_response)
             if not full_response:
                 raise AppError("MODEL_EMPTY_RESPONSE", "模型未生成可展示的回答", status_code=502)
+            token_usage = resolved_token_usage(
+                messages, full_response, provider.token_usage, bigmodel.token_usage
+            )
             if last_plan_step is not None:
                 yield sse(
                     "reasoning.step",
@@ -738,6 +875,7 @@ async def stream_message(
                     "citations": citations,
                     "reasoning_steps": reasoning_steps,
                     "generated_artifacts": generated_artifacts,
+                    "token_usage": token_usage,
                 },
             )
             yield sse(
@@ -745,7 +883,7 @@ async def stream_message(
                 {
                     "message_id": response_id,
                     "finish_reason": "stop",
-                    "usage": None,
+                    "usage": token_usage,
                     "demo_mode": not settings.deepseek_enabled,
                     "tool_calls": tool_call_count,
                     "citations": len(citations),
@@ -756,6 +894,38 @@ async def stream_message(
                 },
             )
         except AppError as exc:
+            if full_response:
+                interrupted_note = (
+                    "\n\n> 本次生成因模型连接波动提前结束，"
+                    "已保留已生成内容，可以继续提问。"
+                )
+                full_response = sanitize_assistant_content(full_response) + interrupted_note
+                yield sse("message.delta", {"text": interrupted_note})
+                interrupted_step = update_step(
+                    "generation-interrupted",
+                    "生成中断",
+                    "模型连接中断，已保留本次已经生成的内容。",
+                    "failed",
+                    "answer",
+                )
+                yield sse("reasoning.step", interrupted_step)
+                await service.add_message(
+                    conversation_id,
+                    "assistant",
+                    full_response,
+                    metadata={"reasoning_steps": reasoning_steps, "interrupted": True},
+                )
+                yield sse(
+                    "message.completed",
+                    {
+                        "message_id": response_id,
+                        "finish_reason": "error",
+                        "interrupted": True,
+                        "provider": "deepseek",
+                        "model": settings.deepseek_model,
+                    },
+                )
+                return
             yield sse(
                 "error",
                 {

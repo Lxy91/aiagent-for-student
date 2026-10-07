@@ -402,6 +402,35 @@ button {
   color: #8d9692;
   font-size: 12px;
 }
+.chat-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.context-meter.ant-btn {
+  display: inline-flex;
+  align-items: center;
+  width: auto;
+  height: 46px;
+  padding: 3px 7px;
+  border-radius: 12px;
+}
+.context-meter-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-left: 7px;
+  line-height: 1.25;
+}
+.chat-toolbar .context-meter-copy strong {
+  color: #314740;
+  font-size: 12px;
+  font-weight: 600;
+}
+.chat-toolbar .context-meter-copy small {
+  color: #8d9692;
+  font-size: 10px;
+}
 .chat-mode-switch.ant-segmented {
   padding: 3px;
   border: 1px solid #cfd8d2;

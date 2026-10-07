@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import math
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -11,6 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import AppError
 from app.infrastructure.db.models import ConversationModel, MessageModel, WorkMaterialModel
 from app.infrastructure.llm.deepseek import DeepSeekProvider
+from app.modules.chat.context import (
+    normalize_role,
+    sanitize_assistant_protocol,
+    sanitize_message_content,
+    wrap_untrusted_content,
+)
 from app.modules.chat.schemas import (
     ConversationResponse,
     CreateConversationRequest,
@@ -18,18 +27,51 @@ from app.modules.chat.schemas import (
     UpdateConversationRequest,
 )
 
+_CJK_CHARACTER_PATTERN = re.compile(
+    "[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]"
+)
+
+
+def estimate_text_tokens(content: str) -> int:
+    """Conservatively estimate tokens without coupling to one provider tokenizer."""
+    if not content:
+        return 0
+    cjk_count = len(_CJK_CHARACTER_PATTERN.findall(content))
+    non_cjk_count = len(content) - cjk_count
+    return cjk_count + math.ceil(non_cjk_count / 4)
+
+
+def estimate_message_tokens(message: dict[str, str]) -> int:
+    """Include a small allowance for role and message framing tokens."""
+    return 4 + estimate_text_tokens(message.get("role", "")) + estimate_text_tokens(
+        message.get("content", "")
+    )
+
+
+def truncate_text_to_token_budget(content: str, token_budget: int) -> tuple[str, bool]:
+    """Keep representative head/tail text while bounding attachment prompt size."""
+    if estimate_text_tokens(content) <= token_budget:
+        return content, False
+    marker = "\n\n[附件内容过长，已按上下文预算截取；中间部分未发送给模型]\n\n"
+    low, high = 0, len(content)
+    best = marker.strip()
+    while low <= high:
+        length = (low + high) // 2
+        head_length = math.ceil(length * 0.7)
+        tail_length = length - head_length
+        tail = content[-tail_length:] if tail_length else ""
+        candidate = f"{content[:head_length]}{marker}{tail}"
+        if estimate_text_tokens(candidate) <= token_budget:
+            best = candidate
+            low = length + 1
+        else:
+            high = length - 1
+    return best, True
+
 
 def sanitize_assistant_content(content: str) -> str:
     """Remove leaked provider tool-protocol markup from displayable assistant text."""
-    lines = [
-        line
-        for line in content.splitlines()
-        if not any(
-            marker in line.lower()
-            for marker in ("dsml", "<tool_calls", "<invoke name=", "<parameter name=")
-        )
-    ]
-    return "\n".join(lines).strip()
+    return sanitize_assistant_protocol(content)
 
 
 def summarize_conversation_title(content: str, max_length: int = 24) -> str:
@@ -51,6 +93,18 @@ def summarize_conversation_title(content: str, max_length: int = 24) -> str:
 class ExecutionNarrative(BaseModel):
     understanding: str = Field(min_length=1, max_length=240)
     next_action: str = Field(min_length=1, max_length=240)
+
+
+@dataclass
+class ContextWindow:
+    messages: list[dict[str, str]]
+    estimated_tokens: int
+    message_count: int
+    trimmed_count: int
+    oldest_included_at: datetime | None
+    database_history_tokens: int
+    current_input_tokens: int
+    summary_tokens: int
 
 
 async def build_execution_narrative(
@@ -209,6 +263,16 @@ class ConversationService:
             raise AppError("CONVERSATION_NOT_FOUND", "会话不存在", status_code=404)
         return item
 
+    async def get_writable(self, user_id: UUID, conversation_id: UUID) -> ConversationModel:
+        item = await self.get_owned(user_id, conversation_id)
+        if item.is_archived:
+            raise AppError(
+                "CONVERSATION_ARCHIVED",
+                "已归档会话不能继续发送消息,请先取消归档",
+                status_code=409,
+            )
+        return item
+
     async def add_message(
         self,
         conversation_id: UUID,
@@ -217,11 +281,13 @@ class ConversationService:
         *,
         metadata: dict | None = None,
     ) -> MessageModel:
+        normalized_role = normalize_role(role, persisted=True)
         item = MessageModel(
             id=str(uuid4()),
             conversation_id=str(conversation_id),
-            role=role,
-            content=sanitize_assistant_content(content) if role == "assistant" else content,
+            role=normalized_role,
+            content=content,
+            sanitized_content=sanitize_message_content(content, normalized_role),
             metadata_json=metadata or {},
             created_at=datetime.now(UTC),
         )
@@ -230,7 +296,11 @@ class ConversationService:
         return item
 
     async def resolve_attachments(
-        self, user_id: UUID, attachment_ids: list[UUID]
+        self,
+        user_id: UUID,
+        attachment_ids: list[UUID],
+        *,
+        token_budget: int = 6_000,
     ) -> tuple[list[dict[str, str]], str, list[dict[str, str]]]:
         if not attachment_ids:
             return [], "", []
@@ -248,6 +318,7 @@ class ConversationService:
         attachments: list[dict[str, str]] = []
         context_sections: list[str] = []
         vision_images: list[dict[str, str]] = []
+        remaining_tokens = token_budget
         for material_id in requested:
             item = by_id[material_id]
             if item.status == "blocked":
@@ -276,47 +347,188 @@ class ConversationService:
                 )
             if item.material_type == "image" and item.binary_content:
                 context_sections.append(
-                    f"[附件：{item.title}；类型：image；图片内容已作为视觉输入提供]"
+                    wrap_untrusted_content(
+                        "attachment",
+                        "图片内容已作为视觉输入提供。",
+                        label=f"{item.title}; type=image",
+                    )
                 )
             elif item.extracted_text or item.content_excerpt:
+                source_text = item.extracted_text or item.content_excerpt
+                bounded_text, was_truncated = truncate_text_to_token_budget(
+                    source_text, max(64, remaining_tokens)
+                )
+                remaining_tokens = max(
+                    0, remaining_tokens - estimate_text_tokens(bounded_text)
+                )
                 context_sections.append(
-                    f"[附件：{item.title}；类型：{item.material_type}]\n"
-                    f"{item.extracted_text or item.content_excerpt}"
+                    wrap_untrusted_content(
+                        "attachment",
+                        bounded_text,
+                        label=(
+                            f"{item.title}; type={item.material_type}; "
+                            f"truncated={str(was_truncated).lower()}"
+                        ),
+                    )
                 )
             else:
                 context_sections.append(
-                    f"[附件：{item.title}；类型：{item.material_type}；"
-                    "当前未提取到可供模型读取的文字内容，请勿推测附件内容]"
+                    wrap_untrusted_content(
+                        "attachment",
+                        "当前未提取到可供模型读取的文字内容,请勿推测附件内容。",
+                        label=f"{item.title}; type={item.material_type}",
+                    )
                 )
         return attachments, "\n\n".join(context_sections), vision_images
 
-    async def recent_messages(self, conversation_id: UUID, limit: int = 12) -> list[dict[str, str]]:
-        result = await self.session.scalars(
-            select(MessageModel)
-            .where(MessageModel.conversation_id == str(conversation_id))
-            .order_by(MessageModel.created_at.desc())
-            .limit(limit)
-        )
-        items = list(result)
-        items.reverse()
-        return [
-            {
+    async def context_window(
+        self, conversation_id: UUID, token_budget: int = 12_000
+    ) -> ContextWindow:
+        """Load newest history that fits the budget, without splitting messages.
+
+        The newest message is the request currently being handled and must never
+        disappear merely because it exceeds the configured history budget.
+        """
+        conversation = await self.session.get(ConversationModel, str(conversation_id))
+        summary_message = None
+        summary_tokens = 0
+        if conversation and conversation.context_summary:
+            summary_message = {
+                "role": "user",
+                "content": wrap_untrusted_content(
+                    "conversation_summary",
+                    conversation.context_summary,
+                    label="此前对话压缩摘要，仅作背景资料",
+                ),
+            }
+            summary_tokens = estimate_message_tokens(summary_message)
+        query = select(MessageModel).where(MessageModel.conversation_id == str(conversation_id))
+        if conversation and conversation.context_cleared_at:
+            query = query.where(MessageModel.created_at >= conversation.context_cleared_at)
+        result = await self.session.scalars(query.order_by(MessageModel.created_at.desc()))
+        eligible = list(result)
+        messages_newest_first: list[dict[str, str]] = []
+        used_tokens = summary_tokens
+        included_items: list[MessageModel] = []
+        for item in eligible:
+            sanitized_content = item.sanitized_content or sanitize_message_content(
+                item.content, item.role
+            )
+            message = {
                 "role": item.role,
                 "content": (
-                    sanitize_assistant_content(item.content)
+                    sanitized_content
                     if item.role == "assistant"
                     else "\n\n".join(
                         part
                         for part in (
-                            item.content,
+                            sanitized_content,
                             (item.metadata_json or {}).get("attachment_context", ""),
                         )
                         if part
                     )
                 ),
             }
-            for item in items
-        ]
+            message_tokens = estimate_message_tokens(message)
+            if messages_newest_first and used_tokens + message_tokens > token_budget:
+                break
+            messages_newest_first.append(message)
+            included_items.append(item)
+            used_tokens += message_tokens
+
+        messages_newest_first.reverse()
+        if summary_message:
+            messages_newest_first.insert(0, summary_message)
+        current_input_tokens = 0
+        if included_items:
+            newest = included_items[0]
+            newest_content = newest.sanitized_content or sanitize_message_content(
+                newest.content, newest.role
+            )
+            current_input_tokens = estimate_message_tokens(
+                {"role": newest.role, "content": newest_content}
+            )
+        return ContextWindow(
+            messages=messages_newest_first,
+            estimated_tokens=used_tokens,
+            message_count=len(messages_newest_first),
+            trimmed_count=max(0, len(eligible) - len(included_items)),
+            oldest_included_at=included_items[-1].created_at if included_items else None,
+            database_history_tokens=max(0, used_tokens - summary_tokens - current_input_tokens),
+            current_input_tokens=current_input_tokens,
+            summary_tokens=summary_tokens,
+        )
+
+    async def recent_messages(
+        self, conversation_id: UUID, token_budget: int = 12_000
+    ) -> list[dict[str, str]]:
+        return (await self.context_window(conversation_id, token_budget)).messages
+
+    async def compress_context(self, user_id: UUID, conversation_id: UUID) -> ConversationModel:
+        item = await self.get_writable(user_id, conversation_id)
+        result = await self.session.scalars(
+            select(MessageModel)
+            .where(
+                MessageModel.conversation_id == str(conversation_id),
+                *(
+                    [MessageModel.created_at >= item.context_cleared_at]
+                    if item.context_cleared_at
+                    else []
+                ),
+            )
+            .order_by(MessageModel.created_at.asc())
+        )
+        item.context_summary = self._compressed_summary(item.context_summary, list(result))
+        item.context_cleared_at = datetime.now(UTC).replace(tzinfo=None)
+        item.context_clear_notice_pending = True
+        await self.session.commit()
+        return item
+
+    async def persist_context_compression(
+        self, conversation_id: UUID, *, oldest_included_at: datetime | None
+    ) -> None:
+        item = await self.session.get(ConversationModel, str(conversation_id))
+        if item is None or oldest_included_at is None:
+            return
+        if item.context_cleared_at is None or oldest_included_at > item.context_cleared_at:
+            result = await self.session.scalars(
+                select(MessageModel)
+                .where(
+                    MessageModel.conversation_id == str(conversation_id),
+                    MessageModel.created_at < oldest_included_at,
+                    *(
+                        [MessageModel.created_at >= item.context_cleared_at]
+                        if item.context_cleared_at
+                        else []
+                    ),
+                )
+                .order_by(MessageModel.created_at.asc())
+            )
+            item.context_summary = self._compressed_summary(item.context_summary, list(result))
+            item.context_cleared_at = oldest_included_at
+        await self.session.commit()
+
+    @staticmethod
+    def _compressed_summary(existing: str, messages: list[MessageModel]) -> str:
+        lines = [existing.strip()] if existing.strip() else []
+        for message in messages:
+            content = message.sanitized_content or sanitize_message_content(
+                message.content, message.role
+            )
+            compact = " ".join(content.split())
+            if compact:
+                label = "用户" if message.role == "user" else "助手"
+                lines.append(f"{label}：{compact[:500]}")
+        summary = "\n".join(lines)
+        return summary[-4000:]
+
+    async def consume_context_clear_notice(self, conversation_id: UUID) -> bool:
+        item = await self.session.get(ConversationModel, str(conversation_id))
+        if item is None or not item.context_clear_notice_pending:
+            return False
+        item.context_clear_notice_pending = False
+        await self.session.commit()
+        return True
 
     async def pending_attachment_edit(self, conversation_id: UUID) -> dict[str, str] | None:
         result = await self.session.scalars(
@@ -345,7 +557,10 @@ class ConversationService:
             "无法直接生成",
             "复制并粘贴",
         )
-        if not any(marker in latest.content for marker in legacy_resume_markers):
+        latest_content = latest.sanitized_content or sanitize_message_content(
+            latest.content, latest.role
+        )
+        if not any(marker in latest_content for marker in legacy_resume_markers):
             return None
         for item in recent:
             metadata = item.metadata_json or {}
@@ -401,9 +616,7 @@ class ConversationService:
                 conversation_id=item.conversation_id,
                 role=item.role,
                 content=(
-                    sanitize_assistant_content(item.content)
-                    if item.role == "assistant"
-                    else item.content
+                    item.sanitized_content if item.role == "assistant" else item.content
                 ),
                 created_at=item.created_at,
                 citations=(item.metadata_json or {}).get("citations", []),
@@ -411,6 +624,7 @@ class ConversationService:
                 attachments=(item.metadata_json or {}).get("attachments", []),
                 generated_images=(item.metadata_json or {}).get("generated_images", []),
                 generated_artifacts=(item.metadata_json or {}).get("generated_artifacts", []),
+                token_usage=(item.metadata_json or {}).get("token_usage"),
             )
             for item in result
         ]

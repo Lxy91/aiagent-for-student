@@ -1,17 +1,22 @@
+import asyncio
 import csv
+import logging
 import re
 from datetime import UTC, datetime, time
+from functools import lru_cache
 from io import BytesIO
-from pathlib import Path
+from threading import Lock
 from uuid import UUID, uuid4
 from zipfile import BadZipFile, ZipFile
 
+import pymupdf
 import xlrd
 from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
+from rapidocr import RapidOCR
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,29 +38,29 @@ from app.modules.growth.schemas import (
     SourceReference,
     WorkMaterialResponse,
 )
+from app.modules.growth.validation import validate_material_upload
 
-ALLOWED_EXTENSIONS = {
-    ".mp3": "audio",
-    ".wav": "audio",
-    ".m4a": "audio",
-    ".png": "image",
-    ".jpg": "image",
-    ".jpeg": "image",
-    ".pdf": "document",
-    ".docx": "document",
-    ".xlsx": "spreadsheet",
-    ".xls": "spreadsheet",
-    ".csv": "spreadsheet",
-    ".txt": "text",
-    ".md": "text",
-}
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_PATTERN = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
-HIGH_RISK_TERMS = ("身份证", "银行卡", "密码", "访问令牌", "access token")
+ID_CARD_PATTERN = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
+BANK_CARD_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){15,18}\d(?!\d)")
+SECRET_VALUE_PATTERN = re.compile(
+    r"(?:密码|password|访问令牌|access[_ -]?token|api[_ -]?key)"
+    r"\s*[:=：]\s*[A-Za-z0-9_./+\-=]{12,}",
+    re.IGNORECASE,
+)
 PDF_MAX_PAGES = 50
+PDF_MAX_OCR_PAGES = 10
 PDF_MAX_EXTRACTED_CHARS = 50_000
 DOCUMENT_MAX_EXTRACTED_CHARS = 50_000
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+logger = logging.getLogger(__name__)
+_OCR_LOCK = Lock()
+
+
+@lru_cache(maxsize=1)
+def _ocr_engine() -> RapidOCR:
+    return RapidOCR()
 
 
 class GrowthService:
@@ -71,20 +76,15 @@ class GrowthService:
         content: bytes,
         purpose: str,
     ) -> WorkMaterialResponse:
-        extension = Path(filename).suffix.lower()
-        material_type = ALLOWED_EXTENSIONS.get(extension)
-        if material_type is None:
-            raise AppError(
-                "UNSUPPORTED_MATERIAL_TYPE",
-                "仅支持音频、截图、PDF、DOCX、Excel、CSV、Markdown 和 TXT 材料",
-                status_code=415,
-            )
         if len(content) > self.max_upload_bytes:
             raise AppError("FILE_TOO_LARGE", "文件不能超过 20 MB", status_code=413)
+        extension, material_type = validate_material_upload(
+            filename, mime_type, content, purpose
+        )
 
         # TODO(multimodal-privacy): Run OCR/privacy detection on images before they can be
         # attached to a chat and sent to an external vision provider.
-        extracted = self._extract_text(extension, content)
+        extracted = await asyncio.to_thread(self._extract_text, extension, content)
         redacted, privacy_status = self._redact(extracted)
         status = "ready" if redacted else "needs_confirmation"
         if privacy_status == "review_required":
@@ -92,7 +92,7 @@ class GrowthService:
         material = WorkMaterialModel(
             id=str(uuid4()),
             user_id=str(user_id),
-            title=Path(filename).name,
+            title=filename.replace("\\", "/").rsplit("/", 1)[-1],
             material_type=material_type,
             mime_type=mime_type or "application/octet-stream",
             size_bytes=len(content),
@@ -395,6 +395,8 @@ class GrowthService:
                 if page_number > PDF_MAX_PAGES or extracted_chars >= PDF_MAX_EXTRACTED_CHARS:
                     break
                 text = (page.extract_text() or "").strip()
+                if not text and page_number <= PDF_MAX_OCR_PAGES:
+                    text = GrowthService._ocr_pdf_page(content, page_number - 1)
                 if not text:
                     continue
                 remaining = PDF_MAX_EXTRACTED_CHARS - extracted_chars
@@ -406,6 +408,20 @@ class GrowthService:
             raise
         except (PdfReadError, OSError, TypeError, ValueError) as exc:
             raise AppError("PDF_PARSE_FAILED", "PDF 文件无法读取或已损坏", status_code=422) from exc
+
+    @staticmethod
+    def _ocr_pdf_page(content: bytes, page_index: int) -> str:
+        """Render an image-only PDF page and recognize Chinese/English text locally."""
+        try:
+            with pymupdf.open(stream=content, filetype="pdf") as document:
+                page = document.load_page(page_index)
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+            with _OCR_LOCK:
+                result = _ocr_engine()(pixmap.tobytes("png"))
+            return "\n".join(result.txts or ()).strip()
+        except Exception:
+            logger.exception("OCR failed for PDF page %s", page_index + 1)
+            return ""
 
     @staticmethod
     def _extract_csv(content: bytes) -> str:
@@ -491,9 +507,10 @@ class GrowthService:
 
     @staticmethod
     def _redact(text: str) -> tuple[str, str]:
-        if any(term.lower() in text.lower() for term in HIGH_RISK_TERMS):
+        redacted = ID_CARD_PATTERN.sub("[身份证号已脱敏]", text)
+        if SECRET_VALUE_PATTERN.search(redacted) or BANK_CARD_PATTERN.search(redacted):
             return "材料包含高风险隐私字段，已阻止自动处理。", "review_required"
-        redacted = EMAIL_PATTERN.sub("[邮箱已脱敏]", text)
+        redacted = EMAIL_PATTERN.sub("[邮箱已脱敏]", redacted)
         redacted = PHONE_PATTERN.sub("[手机号已脱敏]", redacted)
         return redacted, "redacted" if redacted != text else "clear"
 

@@ -11,6 +11,7 @@ from app.core.errors import AppError
 class BigModelProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     async def stream_vision(
         self,
@@ -41,6 +42,7 @@ class BigModelProvider:
             "messages": multimodal_messages,
             "thinking": {"type": "disabled"},
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         async for chunk in self._stream(url, payload):
             yield chunk
@@ -100,6 +102,9 @@ class BigModelProvider:
                     if data == "[DONE]":
                         break
                     chunk = json.loads(data)
+                    usage = chunk.get("usage") or {}
+                    for key in self.token_usage:
+                        self.token_usage[key] += int(usage.get(key) or 0)
                     content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
                     if content:
                         yield content
