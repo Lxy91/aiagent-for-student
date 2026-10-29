@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "启程 · 投递填表助手",
+  "version": "0.5.0",
+  "description": "独立导入简历和维护资料，核对后填入当前招聘页面。",
+  "minimum_chrome_version": "120",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_title": "启程投递填表助手",
+    "default_popup": "popup.html"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtgD3mTlp6G0gWi+xQSVGzN/4jjlxNN8Q03TV/vmZdk5gxDuqG/lU8A3QcKwJR++RtZzX+QaE8m38tOLEd60cfUD5TgA6pNVSL7OrewpLn9lEj4D6dNZhENWdn8Y+Jkl9kLB8+ZliMQKu5GvlYeT7NmtGd47HvY+4WqV9U1efqjsCh4VQ0TbeD+JcuZyU4G6s0qh2v9GHbWfhJNimvqDCAYd+iVTJ0v8h52ly6fh3yTxXp21NDfNa5yDWxzSkg2ihbvAtoihgPgvO/Ifb697wXIfJ0tl4OXsRTMVXZ6Pwg/h/7kmeeeb6VJ84+8BBCZ2ozPA1yFLp56I36lwAfkhMdQIDAQAB",
+  "host_permissions": ["http://127.0.0.1:18765/*"]
+}

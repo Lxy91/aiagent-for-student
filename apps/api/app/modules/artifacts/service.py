@@ -2,11 +2,6 @@ import re
 from io import BytesIO
 from uuid import UUID, uuid4
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -120,62 +115,6 @@ def _document_lines(content: str, title: str) -> list[str]:
     return lines
 
 
-def _set_run_font(run, *, size: float, bold: bool = False, color: str = "222222") -> None:
-    run.font.name = "Calibri"
-    run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "等线")
-    run.font.size = Pt(size)
-    run.bold = bold
-    run.font.color.rgb = RGBColor.from_string(color)
-
-
-def _configure_doc_styles(document: Document) -> None:
-    section = document.sections[0]
-    section.page_width = Inches(8.5)
-    section.page_height = Inches(11)
-    section.top_margin = Inches(1)
-    section.right_margin = Inches(1)
-    section.bottom_margin = Inches(1)
-    section.left_margin = Inches(1)
-    section.header_distance = Inches(0.492)
-    section.footer_distance = Inches(0.492)
-
-    normal = document.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "等线")
-    normal.font.size = Pt(11)
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.line_spacing = 1.1
-
-    heading_tokens = {
-        "Heading 1": (16, "2E74B5", 16, 8),
-        "Heading 2": (13, "2E74B5", 12, 6),
-        "Heading 3": (12, "1F4D78", 8, 4),
-    }
-    for style_name, (size, color, before, after) in heading_tokens.items():
-        style = document.styles[style_name]
-        style.font.name = "Calibri"
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), "等线")
-        style.font.size = Pt(size)
-        style.font.bold = True
-        style.font.color.rgb = RGBColor.from_string(color)
-        style.paragraph_format.space_before = Pt(before)
-        style.paragraph_format.space_after = Pt(after)
-
-
-def _add_page_number(paragraph) -> None:
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = paragraph.add_run()
-    begin = OxmlElement("w:fldChar")
-    begin.set(qn("w:fldCharType"), "begin")
-    instruction = OxmlElement("w:instrText")
-    instruction.set(qn("xml:space"), "preserve")
-    instruction.text = " PAGE "
-    end = OxmlElement("w:fldChar")
-    end.set(qn("w:fldCharType"), "end")
-    run._r.extend([begin, instruction, end])
-    _set_run_font(run, size=9, color="777777")
-
-
 def _parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]]] | None:
     for index in range(len(lines) - 1):
         first = lines[index].strip()
@@ -195,68 +134,12 @@ def _parse_markdown_table(lines: list[str]) -> tuple[list[str], list[list[str]]]
 
 
 def build_docx(prompt: str, content: str) -> tuple[str, bytes]:
+    from app.modules.artifacts.docx_builder import render_docx
+
     del prompt
     title = _document_title(content, "docx")
-    document = Document()
-    _configure_doc_styles(document)
-
-    header = document.sections[0].header.paragraphs[0]
-    header.text = "启程 · 智能对话生成文档"
-    _set_run_font(header.runs[0], size=9, color="777777")
-    _add_page_number(document.sections[0].footer.paragraphs[0])
-
-    title_paragraph = document.add_paragraph()
-    title_paragraph.paragraph_format.space_after = Pt(4)
-    _set_run_font(title_paragraph.add_run(title), size=23, bold=True, color="111111")
-    subtitle = document.add_paragraph()
-    subtitle.paragraph_format.space_after = Pt(16)
-    _set_run_font(subtitle.add_run("根据本次对话自动整理"), size=11, color="666666")
-
-    lines = _document_lines(content, title)
-    table_data = _parse_markdown_table(lines)
-    table_lines: set[str] = set()
-    if table_data:
-        for line in lines:
-            if "|" in line:
-                table_lines.add(line)
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or raw_line in table_lines or re.match(r"^\|?\s*:?-{3,}", line):
-            continue
-        heading = re.match(r"^(#{1,3})\s+(.+)$", line)
-        if heading:
-            document.add_paragraph(heading.group(2), style=f"Heading {len(heading.group(1))}")
-        elif re.match(r"^[-*•]\s+", line):
-            document.add_paragraph(re.sub(r"^[-*•]\s+", "", line), style="List Bullet")
-        elif re.match(r"^\d+[.)、]\s*", line):
-            document.add_paragraph(re.sub(r"^\d+[.)、]\s*", "", line), style="List Number")
-        else:
-            document.add_paragraph(line)
-
-    if table_data:
-        headers, rows = table_data
-        table = document.add_table(rows=1, cols=len(headers))
-        table.autofit = False
-        table.style = "Table Grid"
-        for index, header_text in enumerate(headers):
-            cell = table.rows[0].cells[index]
-            cell.text = header_text
-            shading = OxmlElement("w:shd")
-            shading.set(qn("w:fill"), "F2F4F7")
-            cell._tc.get_or_add_tcPr().append(shading)
-            for run in cell.paragraphs[0].runs:
-                _set_run_font(run, size=10, bold=True)
-        for row in rows:
-            cells = table.add_row().cells
-            for index, value in enumerate(row):
-                cells[index].text = value
-                for run in cells[index].paragraphs[0].runs:
-                    _set_run_font(run, size=10)
-
-    payload = BytesIO()
-    document.save(payload)
-    return f"{title}.docx", payload.getvalue()
+    body = "\n".join(_document_lines(content, title))
+    return f"{title}.docx", render_docx(title, body)
 
 
 def build_xlsx(prompt: str, content: str) -> tuple[str, bytes]:

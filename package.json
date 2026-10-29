@@ -8,7 +8,10 @@
     "build": "pnpm --filter @workplace-agent/web build",
     "typecheck": "pnpm --filter @workplace-agent/web typecheck",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "plugin:build": "pnpm --filter @workplace-agent/application-assistant build",
+    "plugin:test": "pnpm --filter @workplace-agent/application-assistant test",
+    "plugin:serve": "pnpm --filter @workplace-agent/application-assistant model:serve"
   },
   "devDependencies": {
     "prettier": "^3.6.2"

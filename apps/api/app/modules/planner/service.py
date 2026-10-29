@@ -118,11 +118,11 @@ class PlannerService:
         system_prompt = (
             "你是职场行动规划器。把目标拆为 2-5 个可执行步骤，步骤要有完成定义、估时、"
             "优先级、相对截止天数和依赖。不要输出解释，只输出 json。"
-            "JSON 格式示例：{\"title\":\"计划标题\",\"deliverable\":\"最终交付物\","
-            "\"assumptions\":[\"假设\"],\"risks\":[\"风险\"],\"tasks\":[{"
-            "\"title\":\"步骤\",\"description\":\"具体动作\",\"estimated_minutes\":60,"
-            "\"priority\":\"high\",\"due_offset_days\":1,"
-            "\"done_definition\":\"可检查的完成标准\",\"depends_on_indexes\":[]}]}。"
+            'JSON 格式示例：{"title":"计划标题","deliverable":"最终交付物",'
+            '"assumptions":["假设"],"risks":["风险"],"tasks":[{'
+            '"title":"步骤","description":"具体动作","estimated_minutes":60,'
+            '"priority":"high","due_offset_days":1,'
+            '"done_definition":"可检查的完成标准","depends_on_indexes":[]}]}。'
             "depends_on_indexes 使用从 0 开始的前序步骤索引，只能依赖更早步骤。"
         )
         messages = [
@@ -163,9 +163,7 @@ class PlannerService:
         tasks: list[dict] = []
         for index, task in enumerate(generated.tasks):
             dependency_ids = [
-                task_ids[item]
-                for item in task.depends_on_indexes
-                if 0 <= item < index
+                task_ids[item] for item in task.depends_on_indexes if 0 <= item < index
             ]
             tasks.append(
                 {

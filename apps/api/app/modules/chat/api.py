@@ -1,13 +1,18 @@
+import asyncio
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from app.api.dependencies import SettingsDep
+from app.core.diagnostics import error_diagnostic, safe_debug
 from app.core.errors import AppError
 from app.core.security import CurrentUserDep
 from app.infrastructure.db.session import SessionDep
@@ -22,12 +27,34 @@ from app.modules.artifacts.editor import (
     requested_docx_formatting,
     select_edit_target,
 )
+from app.modules.artifacts.quality import review_document
 from app.modules.artifacts.service import (
     ArtifactService,
     artifact_generation_instruction,
     requested_artifact_types,
 )
-from app.modules.chat.context import sanitize_tool_result
+from app.modules.chat.acceptance import acceptance_question, review_acceptance
+from app.modules.chat.context import sanitize_tool_result, wrap_untrusted_content
+from app.modules.chat.drafts import stream_draft
+from app.modules.chat.execution_plan import (
+    PLAN_INSTRUCTION,
+    ExecutionPlan,
+    merge_plan,
+    plan_tool_schema,
+)
+from app.modules.chat.execution_trace import (
+    plan_update_detail,
+    tool_completed_detail,
+    tool_failed_detail,
+    tool_started_detail,
+)
+from app.modules.chat.interrupts import (
+    ExecutionInterrupt,
+    UserQuestion,
+    ask_user_schema,
+    present_question,
+)
+from app.modules.chat.runtime_context import compact_runtime_context
 from app.modules.chat.schemas import (
     ConversationContextResponse,
     ConversationResponse,
@@ -44,8 +71,11 @@ from app.modules.chat.service import (
     estimate_text_tokens,
     sanitize_assistant_content,
 )
+from app.modules.memory.resume import ResumeService
 from app.tools.contracts import ToolContext
 from app.tools.factory import build_tool_registry
+
+logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter(prefix="/conversations", tags=["chat"])
 
@@ -91,9 +121,30 @@ IMAGE_COLLOQUIAL_PATTERN = re.compile(r"(?:给我)?来(?:一|1)?(?:张|幅).{1,6
 IMAGE_GENERATION_CONSULTATION_PATTERNS = (
     re.compile(r"(?:如何|怎么|怎样).{0,20}(?:生成|画|绘制|制作|设计).{0,20}(?:图片|图像|图)"),
     re.compile(r"(?:生成|画|绘制|制作|设计).{0,20}(?:图片|图像|图).{0,8}(?:方法|教程|原理)"),
-    re.compile(r"(?:是否支持|支不支持|支持不支持|有没有).{0,20}(?:图片生成|生成图片|绘图).{0,8}(?:能力|功能)?"),
+    re.compile(
+        r"(?:是否支持|支不支持|支持不支持|有没有).{0,20}(?:图片生成|生成图片|绘图).{0,8}(?:能力|功能)?"
+    ),
 )
 PENDING_EDIT_CANCEL_MARKERS = ("算了", "不用了", "取消", "不处理了", "停止编辑")
+APPLICATION_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
+
+
+def build_runtime_context(now: datetime | None = None) -> str:
+    """Build authoritative, request-scoped time context for the model."""
+    current = now or datetime.now(APPLICATION_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=APPLICATION_TIMEZONE)
+    else:
+        current = current.astimezone(APPLICATION_TIMEZONE)
+    return (
+        "\n\n<runtime_context>\n"
+        f"当前日期：{current.date().isoformat()}\n"
+        "时区：Asia/Shanghai (UTC+08:00)\n"
+        "</runtime_context>\n"
+        "上述运行时日期是日期相关问题的权威依据。回答‘现在’、‘今天’、"
+        "‘今年’、‘明年’等相对时间问题时，必须据此计算，不得依赖模型训练"
+        "知识猜测当前日期。如用户或历史消息中的日期与运行时日期冲突，以此处为准。"
+    )
 
 
 def sse(event: str, data: dict) -> str:
@@ -273,9 +324,7 @@ async def compress_conversation_context(
     session: SessionDep,
 ) -> ConversationContextResponse:
     service = ConversationService(session)
-    conversation = await service.compress_context(
-        current_user.id, conversation_id
-    )
+    conversation = await service.compress_context(current_user.id, conversation_id)
     window = await service.context_window(
         conversation_id, token_budget=settings.chat_history_token_budget
     )
@@ -298,9 +347,20 @@ async def stream_message(
 ) -> StreamingResponse:
     service = ConversationService(session)
     await service.get_writable(current_user.id, conversation_id)
+    resume_state = None
+    if payload.resume_checkpoint_id:
+        resume_state = await service.claim_execution_checkpoint(
+            conversation_id,
+            payload.resume_checkpoint_id,
+            payload.content,
+            payload.resume_action,
+        )
+    task_content = resume_state["user_request"] if resume_state else payload.content
     pending_edit = None
     generated_edit = None
     attachment_ids = payload.attachment_ids
+    if resume_state and not attachment_ids:
+        attachment_ids = [UUID(item) for item in resume_state.get("attachment_ids", [])]
     if not attachment_ids and should_resume_pending_edit(payload.content):
         pending_edit = await service.pending_attachment_edit(conversation_id)
         if pending_edit:
@@ -327,14 +387,60 @@ async def stream_message(
 
     async def event_stream() -> AsyncIterator[str]:
         started_at = perf_counter()
+
+        def emit(event: str, data: dict) -> str:
+            if settings.agent_trace_enabled and event not in {
+                "message.delta",
+                "context.prompt_debug",
+                "usage.updated",
+                "citations",
+                "images",
+                "artifacts",
+                "agent.debug",
+            }:
+                logger.info(
+                    "agent trace=%s conversation=%s elapsed_ms=%s event=%s data=%s",
+                    trace_id,
+                    conversation_id,
+                    round((perf_counter() - started_at) * 1000),
+                    event,
+                    json.dumps(data, ensure_ascii=False, default=str),
+                )
+            return sse(event, data)
+
         response_id = uuid4()
+        debug_sequence = 0
+
+        def debug(kind: str, data: dict) -> str:
+            nonlocal debug_sequence
+            debug_sequence += 1
+            return emit(
+                "agent.debug",
+                {
+                    "kind": kind,
+                    "sequence": debug_sequence,
+                    "trace_id": trace_id,
+                    "conversation_id": str(conversation_id),
+                    "elapsed_ms": round((perf_counter() - started_at) * 1000),
+                    **safe_debug(data),
+                },
+            )
+
         reasoning_steps: list[dict] = []
-        yield sse("message.started", {"message_id": response_id, "trace_id": trace_id})
+        yield emit("message.started", {"message_id": response_id, "trace_id": trace_id})
+        yield debug(
+            "user",
+            {
+                "content": payload.content,
+                "attachment_ids": payload.attachment_ids,
+                "use_plan": payload.use_plan,
+            },
+        )
         context_window = await service.context_window(
             conversation_id, token_budget=settings.chat_history_token_budget
         )
         history = context_window.messages
-        yield sse(
+        yield emit(
             "context.usage",
             {
                 "message_count": context_window.message_count,
@@ -364,7 +470,7 @@ async def stream_message(
                 "elapsed_ms": int((perf_counter() - started_at) * 1000),
             }
             reasoning_steps.append(cleanup_step)
-            yield sse("reasoning.step", cleanup_step)
+            yield emit("reasoning.step", cleanup_step)
         if "附件内容过长，已按上下文预算截取" in attachment_context:
             attachment_step = {
                 "id": "attachment-context-limit",
@@ -375,9 +481,10 @@ async def stream_message(
                 "elapsed_ms": int((perf_counter() - started_at) * 1000),
             }
             reasoning_steps.append(attachment_step)
-            yield sse("reasoning.step", attachment_step)
-        artifact_types = requested_artifact_types(payload.content)
-        artifact_instruction = artifact_generation_instruction(payload.content)
+            yield emit("reasoning.step", attachment_step)
+        artifact_types = requested_artifact_types(task_content)
+        artifact_instruction = artifact_generation_instruction(task_content)
+        resume_context = await ResumeService(session).context(current_user.id)
         messages: list[dict] = [
             {
                 "role": "system",
@@ -389,17 +496,32 @@ async def stream_message(
                     "数据行之间不要插入空行，不要将整段回答包在代码块中。"
                     "遇到最新、当前、政策、招聘行情或用户明确要求搜索的问题，应调用 web.search。"
                     "只引用工具实际返回的来源，不得伪造引用；引用使用 [1]、[2] 编号。"
+                    "搜索摘要不足以确认具体日期、时间、地点或原话时，调用 web.fetch 读取来源正文；"
+                    "遇到失败可更换来源或查询，无法核验时明确说明，禁止补造细节。"
                     "calendar.create_event_draft 只创建草稿，不得声称已写入外部日历。"
                     f"{artifact_instruction}"
+                    f"{build_runtime_context()}"
+                    f"{resume_context}"
+                    f"{PLAN_INSTRUCTION}"
                 ),
             },
             *history,
         ]
+        if resume_state:
+            messages = resume_state["messages"]
+            messages.append({"role": "user", "content": f"对暂停问题的明确答复：{payload.content}"})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "从已保存的检查点继续。保留原任务、步骤ID和已完成结果，"
+                    "根据用户答复更新后续执行；不要重复执行已完成工具。只有用户明确批准的修改才能覆盖原约束。",
+                }
+            )
         system_tokens = estimate_message_tokens(messages[0])
-        yield sse(
+        yield emit(
             "context.prompt_debug",
             {
-                "messages": messages,
+                "messages": safe_debug(messages),
                 "breakdown": {
                     "system_prompt_tokens": system_tokens,
                     "database_history_tokens": context_window.database_history_tokens,
@@ -412,10 +534,128 @@ async def stream_message(
             },
         )
         full_response = ""
-        citations: list[dict] = []
-        observations: list[str] = []
+        citations: list[dict] = resume_state.get("citations", []) if resume_state else []
+        observations: list[str] = resume_state.get("observations", []) if resume_state else []
         tool_call_count = 0
         last_plan_step: dict | None = None
+        execution_plan = (
+            ExecutionPlan.model_validate(resume_state["plan"])
+            if resume_state and resume_state.get("plan")
+            else None
+        )
+        if execution_plan:
+            execution_plan.status = "running"
+        checkpoint = None
+        execution_outputs: list[dict] = resume_state.get("outputs", []) if resume_state else []
+        decisions = [*resume_state.get("decisions", []), payload.content] if resume_state else []
+        pending_interrupt: dict | None = None
+        checkpoint_state: dict | None = None
+        answer_candidate = ""
+        answer_truncated = False
+        defer_delivery = False
+        stop_reason = ""
+
+        async def save_progress(content: str = "", metadata: dict | None = None) -> None:
+            nonlocal checkpoint
+            details = {
+                "reasoning_steps": reasoning_steps,
+                "execution_outputs": execution_outputs,
+                "execution_stop_reason": stop_reason,
+                "delivery_status": "draft" if execution_plan else "final",
+                **(metadata or {}),
+            }
+            if execution_plan is not None:
+                details["execution_plan"] = execution_plan.snapshot(paused=True)
+            if pending_interrupt:
+                details["execution_interrupt"] = pending_interrupt
+                details["execution_checkpoint"] = checkpoint_state
+                details["delivery_status"] = "waiting_user"
+            if execution_plan and execution_plan.status == "cancelled":
+                details["delivery_status"] = "cancelled"
+            is_draft = execution_plan is not None and details["delivery_status"] not in {
+                "final",
+                "cancelled",
+            }
+            if is_draft and content:
+                details["draft_content"] = content
+            saved_content = content or (
+                f"任务执行进度已保存。{stop_reason}，可继续完成剩余步骤。"
+                if stop_reason
+                else "任务执行进度已保存。"
+            )
+            if is_draft:
+                saved_content = (
+                    "方案尚未定稿。确认下面的问题后，我会继续处理。"
+                    if pending_interrupt
+                    else "任务进度已保存，完整方案将在检查通过后展示。"
+                )
+            if execution_plan is not None:
+                summary = "\n".join(
+                    f"- [{task.status}] {task.title}：{task.result}"
+                    for task in execution_plan.tasks
+                )
+                context_content = (content or saved_content) + "\n\n任务计划：\n" + summary
+                if execution_outputs:
+                    context_content += "\n\n已执行步骤的产出：\n" + "\n".join(
+                        f"{item['title']}：{item['content'][:2000]}" for item in execution_outputs
+                    )
+            else:
+                context_content = saved_content
+            if checkpoint is None:
+                checkpoint = await service.add_message(
+                    conversation_id, "assistant", saved_content, metadata=details
+                )
+            else:
+                checkpoint.content = saved_content
+                checkpoint.metadata_json = details
+            checkpoint.sanitized_content = sanitize_assistant_content(context_content)
+            await session.commit()
+
+        async def pause_for_user(question: UserQuestion, kind: str, content: str = "") -> dict:
+            nonlocal pending_interrupt, checkpoint_state
+            if execution_plan:
+                execution_plan.status = "waiting_user"
+            if checkpoint is None:
+                await save_progress(content)
+            pending_interrupt = ExecutionInterrupt.model_validate(
+                present_question(
+                    {
+                        **question.model_dump(),
+                        "id": str(checkpoint.id),
+                        "kind": kind,
+                    }
+                )
+            ).model_dump()
+            if content and (not messages or messages[-1].get("content") != content):
+                messages.append({"role": "assistant", "content": content})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"任务检查点，类型：{kind}。待回答问题：{question.question}\n原因：{question.reason}\n"
+                        "恢复后先处理此问题；缺少交付则修订，用户尚未批准的约束不可变更。"
+                    ),
+                }
+            )
+            checkpoint_state = {
+                "version": 1,
+                "user_request": task_content,
+                "messages": messages,
+                "plan": execution_plan.model_dump() if execution_plan else None,
+                "outputs": execution_outputs,
+                "citations": citations,
+                "observations": observations,
+                "decisions": decisions,
+                "attachment_ids": [str(item) for item in attachment_ids],
+                "draft_content": content,
+                "draft_truncated": "MODEL_OUTPUT_TRUNCATED" in stop_reason
+                or bool(
+                    execution_plan
+                    and any("截断" in issue for issue in execution_plan.acceptance_issues)
+                ),
+            }
+            await save_progress(content or f"任务已暂停，等待你的答复：{question.question}")
+            return pending_interrupt
 
         def update_step(step_id: str, title: str, detail: str, status: str, kind: str) -> dict:
             step = {
@@ -436,10 +676,30 @@ async def stream_message(
 
         try:
             provider = DeepSeekProvider(settings)
+            if payload.use_plan or resume_state:
+                provider.chat_output_limit = settings.task_completion_max_tokens
             bigmodel = BigModelProvider(settings)
-            user_request = payload.content or f"请结合附件回答：{title_source}"
+            user_request = task_content or f"请结合附件回答：{title_source}"
+            if resume_state and execution_plan and payload.resume_action != "cancel":
+                execution_plan.acceptance_status = "pending"
+                await save_progress()
+                yield emit("plan.updated", execution_plan.snapshot())
+            if resume_state and payload.resume_action == "cancel":
+                if execution_plan:
+                    execution_plan.status = "cancelled"
+                stop_reason = "用户结束了本次任务"
+                await save_progress(stop_reason)
+                yield emit("message.delta", {"text": stop_reason})
+                if execution_plan:
+                    yield emit("plan.updated", execution_plan.snapshot())
+                yield emit(
+                    "message.completed", {"message_id": response_id, "finish_reason": "cancelled"}
+                )
+                return
             edit_candidates = (
-                [generated_edit]
+                []
+                if resume_state
+                else [generated_edit]
                 if generated_edit
                 else attachments
                 if pending_edit
@@ -452,9 +712,9 @@ async def stream_message(
                         "检测到多个可编辑文件，请说明要修改哪一个，例如“补全文档1”，"
                         "其余文件会作为参考资料读取。"
                     )
-                    yield sse("message.delta", {"text": full_response})
+                    yield emit("message.delta", {"text": full_response})
                     await service.add_message(conversation_id, "assistant", full_response)
-                    yield sse(
+                    yield emit(
                         "message.completed",
                         {
                             "message_id": response_id,
@@ -471,7 +731,7 @@ async def stream_message(
                     "running",
                     "tool",
                 )
-                yield sse("reasoning.step", edit_step)
+                yield emit("reasoning.step", edit_step)
                 source = edit_target
                 editor = AttachmentEditor(session)
                 filename, descriptor = await editor.describe(current_user.id, UUID(source["id"]))
@@ -502,9 +762,7 @@ async def stream_message(
                 allow_unfilled = allows_unfilled_fields(edit_request)
                 if missing_information and allow_unfilled:
                     missing_information = []
-                    plan_message = (
-                        "已按你的要求保留无法确认的字段，并完成其余可安全填写的内容。"
-                    )
+                    plan_message = "已按你的要求保留无法确认的字段，并完成其余可安全填写的内容。"
                 generated_artifacts: list[dict] = []
                 pending_metadata: dict[str, str] | None = None
                 if missing_information:
@@ -530,14 +788,14 @@ async def stream_message(
                         allow_unchanged=allow_unfilled,
                     )
                     generated_artifacts = [artifact]
-                    yield sse("artifacts", {"items": generated_artifacts})
+                    yield emit("artifacts", {"items": generated_artifacts})
                     full_response = (
                         f"{plan_message or '已按你的要求完成文件修改。'}\n\n"
                         f"已生成《{artifact['filename']}》，点击下方链接即可下载。"
                     )
                     detail = f"已完成 {applied_changes} 项修改并生成可下载副本。"
-                yield sse("message.delta", {"text": full_response})
-                yield sse(
+                yield emit("message.delta", {"text": full_response})
+                yield emit(
                     "reasoning.step",
                     update_step(
                         "attachment-edit",
@@ -557,7 +815,7 @@ async def stream_message(
                         "pending_attachment_edit": pending_metadata,
                     },
                 )
-                yield sse(
+                yield emit(
                     "message.completed",
                     {
                         "message_id": response_id,
@@ -575,7 +833,7 @@ async def stream_message(
                     "running",
                     "tool",
                 )
-                yield sse("reasoning.step", generation_step)
+                yield emit("reasoning.step", generation_step)
                 urls = await bigmodel.generate_image(payload.content)
                 generated_images = [
                     {
@@ -586,9 +844,9 @@ async def stream_message(
                     }
                     for index, url in enumerate(urls)
                 ]
-                yield sse("images", {"items": generated_images})
+                yield emit("images", {"items": generated_images})
                 full_response = image_text_response(payload.content, settings.bigmodel_image_model)
-                yield sse("message.delta", {"text": full_response})
+                yield emit("message.delta", {"text": full_response})
                 generated_artifacts = await ArtifactService(session).create_requested(
                     user_id=current_user.id,
                     conversation_id=conversation_id,
@@ -596,8 +854,8 @@ async def stream_message(
                     content=full_response,
                 )
                 if generated_artifacts:
-                    yield sse("artifacts", {"items": generated_artifacts})
-                yield sse(
+                    yield emit("artifacts", {"items": generated_artifacts})
+                yield emit(
                     "reasoning.step",
                     update_step(
                         "image-generation",
@@ -617,7 +875,7 @@ async def stream_message(
                         "generated_artifacts": generated_artifacts,
                     },
                 )
-                yield sse(
+                yield emit(
                     "message.completed",
                     {
                         "message_id": response_id,
@@ -627,19 +885,89 @@ async def stream_message(
                     },
                 )
                 return
-            search_required = requires_web_search(payload.content)
+            search_required = requires_web_search(task_content)
             if search_required and not settings.online_search_available:
                 raise AppError(
                     "TOOL_UNAVAILABLE",
                     "联网搜索尚未配置，请由管理员设置 TAVILY_API_KEY",
                     status_code=503,
                 )
-            available_effects = {"draft"}
-            if settings.online_search_available:
-                available_effects.add("read")
-            tool_schemas = registry.model_schemas(effects=available_effects)
-            for iteration in range(4):
-                if search_required and not settings.deepseek_enabled and iteration == 0:
+            tool_schemas = registry.model_schemas(
+                effects={"draft", "read"},
+                excluded_names=set()
+                if settings.online_search_available
+                else {"web.search", "web.fetch"},
+            )
+            tool_schemas.append(plan_tool_schema())
+            tool_schemas.append(ask_user_schema())
+            iteration = 0
+            iteration_limit = settings.agent_max_iterations
+            search_done = (
+                (bool(citations) or any(item.startswith("web.search") for item in observations))
+                if resume_state
+                else False
+            )
+            force_plan_update = False
+            stagnant_rounds = 0
+            progress_signature = ""
+
+            def prepare_context() -> tuple[list[dict], dict]:
+                context = compact_runtime_context(
+                    messages,
+                    tool_schemas,
+                    settings.agent_context_token_budget,
+                    plan=execution_plan.snapshot() if execution_plan else None,
+                    citations=citations,
+                    observations=observations,
+                    original_request=task_content if resume_state else None,
+                )
+                return context.messages, {
+                    "message_count": len(context.messages),
+                    "estimated_tokens": context.estimated_tokens,
+                    "token_budget": settings.agent_context_token_budget,
+                    "trimmed_count": context.removed_messages,
+                    "compacted": context.compacted,
+                    "before_tokens": context.before_tokens,
+                }
+
+            while iteration < iteration_limit:
+                if (
+                    resume_state
+                    and resume_state.get("draft_truncated")
+                    and execution_plan
+                    and all(task.status == "completed" for task in execution_plan.tasks)
+                    and resume_state.get("draft_content")
+                    and not any(
+                        word in payload.content for word in ("调整输出范围", "精简", "重写")
+                    )
+                ):
+                    answer_candidate = resume_state["draft_content"]
+                    answer_truncated = True
+                    break
+                iteration += 1
+                if await request.is_disconnected():
+                    return
+                messages, live_context = prepare_context()
+                yield emit("context.usage", live_context)
+                if live_context["compacted"]:
+                    yield debug("context.compacted", live_context)
+                    yield emit(
+                        "reasoning.step",
+                        update_step(
+                            f"runtime-context-{iteration}",
+                            "执行上下文整理",
+                            f"已整理本轮工具上下文：{live_context['before_tokens']} → "
+                            f"{live_context['estimated_tokens']} Token，"
+                            "保留原始任务、计划与来源，继续执行。",
+                            "completed",
+                            "analysis",
+                        ),
+                    )
+                yield emit(
+                    "agent.iteration",
+                    {"iteration": iteration, "max_iterations": iteration_limit},
+                )
+                if search_required and not settings.deepseek_enabled and iteration == 1:
                     call = {
                         "id": f"call-{uuid4()}",
                         "type": "function",
@@ -664,41 +992,117 @@ async def stream_message(
                     decision_message = None
                     tool_calls = []
                 else:
-                    decision_message, tool_calls = await provider.select_tool_calls(
-                        messages,
-                        tool_schemas,
-                        force_tool_name=(
-                            "web__search" if search_required and iteration == 0 else None
-                        ),
+                    forced_tool = (
+                        "execution__update_plan"
+                        if force_plan_update
+                        or (payload.use_plan and execution_plan is None and iteration == 1)
+                        else "web__search"
+                        if search_required and not search_done
+                        else None
+                    )
+                    yield debug(
+                        "model.request",
+                        {
+                            "phase": "工具规划",
+                            "iteration": iteration,
+                            "model": settings.deepseek_model,
+                            "messages": messages,
+                            "tools": tool_schemas,
+                            "tool_choice": {"type": "function", "function": {"name": forced_tool}}
+                            if forced_tool
+                            else "auto",
+                        },
+                    )
+                    for attempt in range(3):
+                        try:
+                            decision_message, tool_calls = await provider.select_tool_calls(
+                                messages,
+                                tool_schemas,
+                                force_tool_name=forced_tool,
+                            )
+                            if attempt:
+                                yield emit(
+                                    "reasoning.step",
+                                    update_step(
+                                        f"model-retry-{iteration}",
+                                        "连接恢复",
+                                        "模型请求已恢复，继续执行任务。",
+                                        "completed",
+                                        "analysis",
+                                    ),
+                                )
+                            break
+                        except AppError as exc:
+                            if not exc.retryable or attempt == 2:
+                                raise
+                            yield debug(
+                                "retry",
+                                {
+                                    **error_diagnostic(exc),
+                                    "attempt": attempt + 1,
+                                    "phase": "工具规划",
+                                },
+                            )
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    f"model-retry-{iteration}",
+                                    "连接重试",
+                                    f"模型请求暂时失败，正在自动重试（{attempt + 1}/2）："
+                                    f"{exc.message}",
+                                    "running",
+                                    "analysis",
+                                ),
+                            )
+                            await asyncio.sleep(attempt + 1)
+                            if await request.is_disconnected():
+                                return
+                    yield debug(
+                        "model.response",
+                        {
+                            "phase": "工具规划",
+                            "iteration": iteration,
+                            "content": (decision_message or {}).get("content"),
+                            "tool_calls": tool_calls,
+                        },
                     )
                 selected_tools = [
                     str((call.get("function") or {}).get("name") or "").replace("__", ".")
-                    for call in tool_calls[:3]
+                    for call in tool_calls
                 ]
+                progress_only = bool(selected_tools) and all(
+                    name == "execution.update_plan" for name in selected_tools
+                )
                 narrative = (
-                    artifact_execution_narrative(artifact_types, selected_tools)
-                    if artifact_types and iteration == 0
+                    ExecutionNarrative(
+                        understanding="准备调用 execution.update_plan，"
+                        + ("更新已有计划。" if execution_plan else "建立任务清单。"),
+                        next_action="准备核对任务步骤的实际进度。",
+                    )
+                    if progress_only
+                    else artifact_execution_narrative(artifact_types, selected_tools)
+                    if artifact_types and iteration == 1
                     else await build_execution_narrative(
                         provider,
                         user_request=user_request,
                         selected_tools=selected_tools,
                         observations=observations,
-                        iteration=iteration,
+                        iteration=iteration - 1,
                     )
                 )
                 if provider.token_usage["total_tokens"]:
-                    yield sse(
+                    yield emit(
                         "usage.updated",
                         {"usage": {**provider.token_usage, "estimated": False}},
                     )
-                if iteration == 0 and attachments:
+                if iteration == 1 and attachments:
                     understanding, next_action = attachment_execution_summary(
                         payload.content, attachments, vision_images
                     )
                     narrative.understanding = understanding
                     narrative.next_action = next_action
-                if iteration == 0:
-                    yield sse(
+                if iteration == 1:
+                    yield emit(
                         "reasoning.step",
                         update_step(
                             "understand",
@@ -708,68 +1112,350 @@ async def stream_message(
                             "analysis",
                         ),
                     )
-                plan_step_id = f"plan-{iteration + 1}"
-                last_plan_step = update_step(
-                    plan_step_id,
-                    "下一步计划",
-                    narrative.next_action,
-                    "completed" if tool_calls else "running",
-                    "plan",
-                )
-                yield sse("reasoning.step", last_plan_step)
+                if not progress_only:
+                    plan_step_id = f"plan-{iteration}"
+                    last_plan_step = update_step(
+                        plan_step_id,
+                        "下一步计划",
+                        narrative.next_action,
+                        "completed" if tool_calls else "running",
+                        "plan",
+                    )
+                    yield emit("reasoning.step", last_plan_step)
                 if not tool_calls:
+                    if last_plan_step:
+                        yield emit(
+                            "reasoning.step",
+                            update_step(
+                                last_plan_step["id"],
+                                last_plan_step["title"],
+                                last_plan_step["detail"],
+                                "completed",
+                                last_plan_step["kind"],
+                            ),
+                        )
+                    runnable = (
+                        [
+                            task
+                            for task in execution_plan.tasks
+                            if task.status in {"pending", "running"}
+                        ]
+                        if execution_plan
+                        else []
+                    )
+                    if runnable and settings.deepseek_enabled:
+                        stagnant_rounds += 1
+                        content = str((decision_message or {}).get("content") or "").strip()
+                        if content:
+                            execution_outputs.append(
+                                {
+                                    "task_id": runnable[0].id,
+                                    "title": runnable[0].title,
+                                    "content": content,
+                                }
+                            )
+                            messages.append({"role": "assistant", "content": content})
+                            await save_progress()
+                        if stagnant_rounds >= 3:
+                            stop_reason = "连续多轮未更新任务进度，已停止重复执行"
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    "execution-stalled",
+                                    "任务受阻",
+                                    stop_reason,
+                                    "failed",
+                                    "plan",
+                                ),
+                            )
+                            break
+                        force_plan_update = True
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": "任务仍有未完成步骤，不得在此结束。"
+                                "请依据刚才实际完成的内容调用 execution.update_plan 更新进度，"
+                                "并继续下一步；若没有实际产出则继续执行当前步骤。"
+                                "确实无法完成的步骤请标记 blocked 并说明原因，不得虚报完成。"
+                                f"当前步骤：{runnable[0].title}",
+                            }
+                        )
+                        yield emit(
+                            "reasoning.step",
+                            update_step(
+                                f"auto-continue-{iteration}",
+                                "继续执行",
+                                f"计划尚未完成，正在推进：{runnable[0].title}。",
+                                "completed",
+                                "plan",
+                            ),
+                        )
+                        continue
+                    if execution_plan and any(
+                        task.status == "blocked" for task in execution_plan.tasks
+                    ):
+                        stop_reason = "剩余步骤受阻：" + "；".join(
+                            f"{task.title}：{task.result}"
+                            for task in execution_plan.tasks
+                            if task.status == "blocked"
+                        )
+                    answer_candidate = str((decision_message or {}).get("content") or "").strip()
+                    answer_truncated = provider.last_selection_finish_reason == "length"
                     break
                 messages.append(decision_message)
-                for call in tool_calls[:3]:
+                for call_index, call in enumerate(tool_calls):
                     tool_call_count += 1
                     function = call.get("function") or {}
                     tool_name = str(function.get("name") or "").replace("__", ".")
+                    call_started_at = perf_counter()
+                    expected_schema = next(
+                        (
+                            item["function"]["parameters"]
+                            for item in tool_schemas
+                            if item["function"]["name"].replace("__", ".") == tool_name
+                        ),
+                        None,
+                    )
+                    call_debug = {
+                        "tool_call_id": call.get("id"),
+                        "tool": tool_name,
+                        "trace_id": trace_id,
+                        "iteration": iteration,
+                    }
                     try:
                         arguments = json.loads(function.get("arguments") or "{}")
-                    except json.JSONDecodeError as exc:
-                        raise AppError(
-                            "TOOL_VALIDATION_ERROR",
-                            "模型生成的工具参数无效",
-                            status_code=422,
-                        ) from exc
-                    definition = registry.get(tool_name)
+                        if not isinstance(arguments, dict):
+                            raise ValueError("工具参数必须是 JSON 对象")
+                    except (ValueError, TypeError) as exc:
+                        failure = {
+                            **call_debug,
+                            "arguments": safe_debug(function.get("arguments")),
+                            "code": "TOOL_VALIDATION_ERROR",
+                            "status": 422,
+                            "message": "模型生成的工具参数不是有效的 JSON 对象",
+                            "details": [{"error": str(exc)}],
+                            "retryable": False,
+                            "input_schema": expected_schema,
+                        }
+                        yield emit(
+                            "tool.started",
+                            safe_debug({**call_debug, "arguments": function.get("arguments")}),
+                        )
+                        yield emit("tool.failed", safe_debug(failure))
+                        yield emit(
+                            "reasoning.step",
+                            update_step(
+                                f"tool-{tool_call_count}",
+                                "工具参数错误",
+                                f"{tool_name}：参数不是合法 JSON，本次未执行，正在修正。",
+                                "failed",
+                                "tool",
+                            ),
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.get("id"),
+                                "content": sanitize_tool_result(tool_name, failure),
+                            }
+                        )
+                        continue
+                    call_debug["arguments"] = safe_debug(arguments)
+                    yield emit("tool.started", call_debug)
                     step_id = f"tool-{tool_call_count}"
-                    yield sse(
+                    yield emit(
                         "reasoning.step",
                         update_step(
                             step_id,
                             "调用工具",
-                            f"正在运行 {definition.name}。",
+                            tool_started_detail(tool_name, arguments),
                             "running",
                             "tool",
                         ),
                     )
-                    yield sse(
-                        "tool.started",
-                        {
-                            "tool_call_id": call.get("id"),
-                            "tool": definition.name,
-                            "effect": definition.effect,
-                        },
-                    )
+                    if tool_name == "execution.ask_user":
+                        try:
+                            question = UserQuestion.model_validate(arguments)
+                        except ValidationError as exc:
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.get("id"),
+                                    "content": f"问题参数不合法，请修正：{exc}",
+                                }
+                            )
+                            yield emit(
+                                "tool.failed",
+                                {
+                                    **call_debug,
+                                    "code": "TOOL_VALIDATION_ERROR",
+                                    "message": str(exc),
+                                },
+                            )
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    step_id,
+                                    "问题参数错误",
+                                    "execution.ask_user：问题参数未通过校验，正在修正。",
+                                    "failed",
+                                    "tool",
+                                ),
+                            )
+                            continue
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.get("id"),
+                                "content": "任务已暂停，等待用户答复；答复前不执行其他操作。",
+                            }
+                        )
+                        for deferred in tool_calls[call_index + 1 :]:
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": deferred.get("id"),
+                                    "content": "未执行：等待用户决定。恢复后按需要重新选择工具。",
+                                }
+                            )
+                        question_step = update_step(
+                            step_id,
+                            "等待答复",
+                            "execution.ask_user：已保存进度，等待你的答复。",
+                            "completed",
+                            "tool",
+                        )
+                        interrupt = await pause_for_user(question, "question")
+                        yield emit("reasoning.step", question_step)
+                        if execution_plan:
+                            yield emit("plan.updated", execution_plan.snapshot())
+                        yield emit("execution.interrupted", interrupt)
+                        yield emit(
+                            "message.completed",
+                            {"message_id": response_id, "finish_reason": "interrupt"},
+                        )
+                        return
+                    if tool_name == "execution.update_plan":
+                        try:
+                            previous_plan = execution_plan
+                            execution_plan = merge_plan(execution_plan, arguments)
+                            provider.chat_output_limit = settings.task_completion_max_tokens
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    step_id,
+                                    "更新计划",
+                                    plan_update_detail(previous_plan, execution_plan),
+                                    "completed",
+                                    "tool",
+                                ),
+                            )
+                            signature = json.dumps(
+                                [task.model_dump() for task in execution_plan.tasks],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            if signature != progress_signature:
+                                stagnant_rounds = 0
+                                progress_signature = signature
+                            force_plan_update = False
+                            iteration_limit = min(
+                                50, max(iteration_limit, len(execution_plan.tasks) * 4 + 4)
+                            )
+                            await save_progress()
+                            snapshot = execution_plan.snapshot()
+                            yield emit("plan.updated", snapshot)
+                            result_text = json.dumps(snapshot, ensure_ascii=False)
+                            yield emit(
+                                "tool.completed",
+                                {
+                                    **call_debug,
+                                    "result": snapshot,
+                                    "elapsed_ms": round((perf_counter() - call_started_at) * 1000),
+                                },
+                            )
+                        except (ValidationError, ValueError) as exc:
+                            result_text = "计划更新失败，请修正：" + str(exc)[:1200]
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    step_id,
+                                    "计划更新失败",
+                                    "execution.update_plan：步骤参数未通过校验，正在修正，原计划保持不变。",
+                                    "failed",
+                                    "tool",
+                                ),
+                            )
+                            yield emit(
+                                "tool.failed",
+                                safe_debug(
+                                    {
+                                        **call_debug,
+                                        "code": "TOOL_VALIDATION_ERROR",
+                                        "status": 422,
+                                        "message": "计划参数不符合约定",
+                                        "retryable": False,
+                                        "details": exc.errors(
+                                            include_url=False, include_context=False
+                                        )
+                                        if isinstance(exc, ValidationError)
+                                        else [{"message": str(exc)}],
+                                        "input_schema": expected_schema,
+                                    }
+                                ),
+                            )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.get("id"),
+                                "content": result_text,
+                            }
+                        )
+                        continue
+                    if tool_name == "web.search":
+                        search_done = True
                     try:
+                        definition = registry.get(tool_name)
                         result = await registry.invoke(
                             definition.name,
                             arguments,
                             ToolContext(user_id=current_user.id, trace_id=trace_id),
                         )
-                    except AppError:
-                        yield sse(
+                    except AppError as exc:
+                        yield emit(
+                            "tool.failed",
+                            {
+                                **call_debug,
+                                **error_diagnostic(exc),
+                                "input_schema": safe_debug(expected_schema),
+                                "elapsed_ms": round((perf_counter() - call_started_at) * 1000),
+                            },
+                        )
+                        yield emit(
                             "reasoning.step",
                             update_step(
                                 step_id,
                                 "调用工具",
-                                f"运行 {definition.name} 失败。",
+                                tool_failed_detail(tool_name, arguments, exc.message, exc.code),
                                 "failed",
                                 "tool",
                             ),
                         )
-                        raise
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.get("id"),
+                                "content": sanitize_tool_result(
+                                    tool_name,
+                                    {
+                                        **error_diagnostic(exc),
+                                        "input_schema": expected_schema,
+                                    },
+                                ),
+                            }
+                        )
+                        observations.append(f"{tool_name} 失败：{exc.code}，{exc.message}")
+                        continue
                     result_payload = result.model_dump(mode="json")
                     result_count = len(result_payload.get("results", []))
                     observations.append(
@@ -777,31 +1463,33 @@ async def stream_message(
                         if definition.name == "web.search"
                         else f"{definition.name} 执行完成"
                     )
-                    yield sse(
+                    yield emit(
                         "tool.completed",
                         {
-                            "tool_call_id": call.get("id"),
-                            "tool": definition.name,
+                            **call_debug,
                             "result_count": result_count,
+                            "result": safe_debug(result_payload),
+                            "elapsed_ms": round((perf_counter() - call_started_at) * 1000),
                         },
                     )
-                    yield sse(
+                    yield emit(
                         "reasoning.step",
                         update_step(
                             step_id,
                             "观察工具结果",
-                            (
-                                f"运行了 {definition.name}，获得 {result_count} 条结果。"
-                                if definition.name == "web.search"
-                                else f"运行了 {definition.name}。"
-                            ),
+                            tool_completed_detail(definition.name, arguments, result_payload),
                             "completed",
                             "tool",
                         ),
                     )
-                    if definition.name == "web.search":
+                    if definition.name in {"web.search", "web.fetch"}:
                         known_urls = {item["url"] for item in citations}
-                        for item in result_payload["results"]:
+                        source_results = result_payload.get("results", [])
+                        if definition.name == "web.fetch":
+                            source_results = [
+                                {**result_payload, "snippet": result_payload["content"][:1200]}
+                            ]
+                        for item in source_results:
                             if item["url"] in known_urls:
                                 continue
                             citations.append(
@@ -816,7 +1504,7 @@ async def stream_message(
                             )
                             known_urls.add(item["url"])
                         citations = citations[:8]
-                        yield sse("citations", {"items": citations})
+                        yield emit("citations", {"items": citations})
                     messages.append(
                         {
                             "role": "tool",
@@ -825,31 +1513,318 @@ async def stream_message(
                         }
                     )
 
-            if search_required and tool_call_count == 0:
+            else:
+                stop_reason = "已达到本次执行轮数上限"
+                yield emit(
+                    "agent.limit_reached",
+                    {
+                        "max_iterations": iteration_limit,
+                        "tool_calls": tool_call_count,
+                    },
+                )
+                yield emit(
+                    "reasoning.step",
+                    update_step(
+                        "iteration-limit",
+                        "任务暂停",
+                        "已达到本次执行轮数上限，将汇总已完成结果；未完成步骤保留在计划中。",
+                        "failed",
+                        "plan",
+                    ),
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "已达到工具迭代上限。停止调用工具，基于已有结果回答，"
+                        "明确说明尚未完成的核验和信息缺口，不得声称任务已经全部完成。",
+                    }
+                )
+
+            if execution_plan is not None and stop_reason:
+                execution_plan.explanation = stop_reason
+            yield emit("agent.answer_started", {"tool_calls": tool_call_count})
+            if search_required and not search_done:
                 raise AppError(
                     "TOOL_SELECTION_FAILED",
                     "模型未能生成有效的联网搜索调用，请稍后重试",
                     status_code=502,
                     retryable=True,
                 )
-            response_stream = (
-                bigmodel.stream_vision(messages, vision_images)
-                if vision_images
-                else provider.stream_chat(messages)
+            messages, live_context = prepare_context()
+            yield emit("context.usage", live_context)
+            if live_context["compacted"]:
+                yield debug("context.compacted", live_context)
+
+            def saved_output_text() -> str:
+                parts = []
+                latest = {
+                    item.get("task_id", str(index)): item
+                    for index, item in enumerate(execution_outputs)
+                }
+                for item in [] if resume_state and answer_candidate else latest.values():
+                    if item["content"] not in parts:
+                        parts.append(item["content"])
+                if answer_candidate and answer_candidate not in parts:
+                    parts.append(answer_candidate)
+                return "\n\n".join(parts)
+
+            reuse_outputs = execution_plan is not None and bool(
+                execution_outputs or answer_candidate
             )
-            async for chunk in response_stream:
-                if await request.is_disconnected():
-                    return
-                full_response += chunk
-                yield sse("message.delta", {"text": chunk})
+            defer_delivery = execution_plan is not None
+            yield debug(
+                "assistant.output" if reuse_outputs else "model.request",
+                {
+                    "phase": "生成回答",
+                    "messages": messages,
+                    "model": settings.bigmodel_vision_model
+                    if vision_images
+                    else settings.deepseek_model,
+                    "max_tokens": provider.chat_output_limit,
+                },
+            )
+            if defer_delivery:
+                yield emit(
+                    "execution.phase",
+                    {"phase": "drafting", "detail": "正在生成草稿，检查通过后展示完整方案。"},
+                )
+                async for event in stream_draft(
+                    provider,
+                    messages,
+                    settings.agent_context_token_budget,
+                    plan=execution_plan.model_dump(),
+                    original_request=task_content,
+                    citations=citations,
+                    first_text=saved_output_text() if reuse_outputs else None,
+                    first_truncated=answer_truncated,
+                ):
+                    if await request.is_disconnected():
+                        return
+                    if event["type"] == "delta":
+                        full_response += event["text"]
+                    elif event["type"] == "phase":
+                        yield emit(
+                            "execution.phase", {"phase": "drafting", "detail": event["detail"]}
+                        )
+                    else:
+                        yield debug("model.request", {"phase": "补完草稿", **event})
+            else:
+                response_stream = (
+                    bigmodel.stream_vision(messages, vision_images)
+                    if vision_images
+                    else provider.stream_chat(messages)
+                )
+                async for chunk in response_stream:
+                    if await request.is_disconnected():
+                        return
+                    full_response += chunk
+                    yield emit("message.delta", {"text": chunk})
             full_response = sanitize_assistant_content(full_response)
             if not full_response:
                 raise AppError("MODEL_EMPTY_RESPONSE", "模型未生成可展示的回答", status_code=502)
-            token_usage = resolved_token_usage(
-                messages, full_response, provider.token_usage, bigmodel.token_usage
-            )
+            if execution_plan is not None:
+                if all(task.status == "completed" for task in execution_plan.tasks):
+                    yield emit(
+                        "execution.phase",
+                        {
+                            "phase": "checking",
+                            "detail": "草稿已生成，正在检查内容、工时和日期；还不是最终方案。",
+                        },
+                    )
+                    yield emit(
+                        "reasoning.step",
+                        update_step(
+                            "task-acceptance",
+                            "任务验收",
+                            "正在独立核对交付、用户约束与容量计算。",
+                            "running",
+                            "analysis",
+                        ),
+                    )
+                    for revision in range(settings.task_acceptance_max_revisions + 1):
+                        yield emit(
+                            "execution.phase",
+                            {
+                                "phase": "checking",
+                                "detail": "正在检查草稿，正文将在检查通过后展示。",
+                            },
+                        )
+                        report = await review_acceptance(
+                            provider,
+                            task_content,
+                            execution_plan.model_dump(),
+                            full_response,
+                            decisions,
+                        )
+                        execution_plan.acceptance_status = report.status
+                        execution_plan.acceptance_issues = report.issues
+                        yield debug(
+                            "task.acceptance", {**report.model_dump(), "revision": revision}
+                        )
+                        if (
+                            report.review_error
+                            and revision < settings.task_acceptance_max_revisions
+                        ):
+                            yield emit(
+                                "reasoning.step",
+                                update_step(
+                                    "task-acceptance",
+                                    "重试检查",
+                                    f"检查暂时没有完成，正在自动重试（{revision + 1}/"
+                                    f"{settings.task_acceptance_max_revisions}）。",
+                                    "running",
+                                    "analysis",
+                                ),
+                            )
+                            await asyncio.sleep(1)
+                            if await request.is_disconnected():
+                                return
+                            continue
+                        if (
+                            report.status in {"passed", "needs_input"}
+                            or report.review_error
+                            or revision >= settings.task_acceptance_max_revisions
+                        ):
+                            break
+                        yield emit(
+                            "reasoning.step",
+                            update_step(
+                                "task-acceptance",
+                                "自动修订",
+                                f"正在修正计算和排期问题（{revision + 1}/"
+                                f"{settings.task_acceptance_max_revisions}），无需你处理。",
+                                "running",
+                                "analysis",
+                            ),
+                        )
+                        yield emit(
+                            "execution.phase",
+                            {
+                                "phase": "revising",
+                                "detail": f"正在修正草稿（{revision + 1}/"
+                                f"{settings.task_acceptance_max_revisions}），检查通过后展示。",
+                            },
+                        )
+                        messages.extend(
+                            [
+                                {"role": "assistant", "content": full_response},
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "内部检查发现以下问题，请自行修订并输出完整方案，不要只解释错误或要求用户排错。"
+                                        "保留用户原约束、原计划日期、任务范围和已批准的决定。"
+                                        "数字加总、日周上限、截止日期和依赖必须逐项校验；"
+                                        "不得把硬约束改成平均值，也不得改休息日或把排程整体后移。"
+                                        "只有用户原始要求本身确实互相冲突时，才明确提出一个简短的取舍问题。"
+                                        "待修订问题（内部参考，不要原样输出）："
+                                        + wrap_untrusted_content(
+                                            "repair_findings",
+                                            json.dumps(report.issues, ensure_ascii=False),
+                                        )
+                                    ),
+                                },
+                            ]
+                        )
+                        messages, live_context = prepare_context()
+                        yield emit("context.usage", live_context)
+                        yield debug(
+                            "model.request",
+                            {
+                                "phase": "自动修订",
+                                "messages": messages,
+                                "model": settings.deepseek_model,
+                            },
+                        )
+                        revised = ""
+                        async for event in stream_draft(
+                            provider,
+                            messages,
+                            settings.agent_context_token_budget,
+                            plan=execution_plan.model_dump(),
+                            original_request=task_content,
+                            citations=citations,
+                        ):
+                            if await request.is_disconnected():
+                                return
+                            if event["type"] == "delta":
+                                revised += event["text"]
+                                full_response = revised
+                            elif event["type"] == "phase":
+                                yield emit(
+                                    "execution.phase",
+                                    {"phase": "revising", "detail": event["detail"]},
+                                )
+                            else:
+                                yield debug("model.request", {"phase": "补完修订稿", **event})
+                        revised = sanitize_assistant_content(revised)
+                        if not revised:
+                            raise AppError(
+                                "MODEL_EMPTY_RESPONSE", "自动修订未生成内容", status_code=502
+                            )
+                        full_response = revised
+                    yield emit(
+                        "reasoning.step",
+                        update_step(
+                            "task-acceptance",
+                            "任务验收",
+                            "任务验收通过。"
+                            if report.status == "passed"
+                            else "需要你决定一项安排。"
+                            if report.status == "needs_input"
+                            else "方案已保存，仍有检查项需要继续处理。",
+                            "completed" if report.status == "passed" else "failed",
+                            "analysis",
+                        ),
+                    )
+                    if report.status == "failed":
+                        stop_reason = (
+                            "检查服务暂时不可用，草稿已保存，本次未完成验收。"
+                            if report.review_error
+                            else "自动修订后仍未通过检查，草稿已保存，本次未能交付合格方案。"
+                        )
+                        execution_plan.status = "paused"
+                        execution_plan.explanation = stop_reason
+                        await save_progress(full_response)
+                        yield emit("plan.updated", execution_plan.snapshot(paused=True))
+                        yield emit("execution.phase", {"phase": "failed", "detail": stop_reason})
+                        yield emit(
+                            "message.completed",
+                            {"message_id": response_id, "finish_reason": "failed"},
+                        )
+                        return
+                    if report.status == "needs_input":
+                        question = acceptance_question(report)
+                        interrupt = await pause_for_user(
+                            question,
+                            "error" if report.review_error else "acceptance",
+                            full_response,
+                        )
+                        yield emit("plan.updated", execution_plan.snapshot())
+                        yield emit("execution.interrupted", interrupt)
+                        yield emit(
+                            "message.completed",
+                            {"message_id": response_id, "finish_reason": "interrupt"},
+                        )
+                        return
+                elif stop_reason:
+                    interrupt = await pause_for_user(
+                        UserQuestion(
+                            question="任务尚未完成，要继续执行还是调整要求？",
+                            reason=stop_reason,
+                            options=["继续执行剩余步骤", "调整任务要求"],
+                        ),
+                        "error",
+                        full_response,
+                    )
+                    yield emit("plan.updated", execution_plan.snapshot())
+                    yield emit("execution.interrupted", interrupt)
+                    yield emit(
+                        "message.completed",
+                        {"message_id": response_id, "finish_reason": "interrupt"},
+                    )
+                    return
             if last_plan_step is not None:
-                yield sse(
+                yield emit(
                     "reasoning.step",
                     update_step(
                         last_plan_step["id"],
@@ -859,30 +1834,111 @@ async def stream_message(
                         last_plan_step["kind"],
                     ),
                 )
+            document_content = full_response
+            document_quality = None
+            if "docx" in artifact_types:
+                missing_sources = [
+                    item for item in citations if item["url"] not in document_content
+                ]
+                if missing_sources:
+                    document_content += "\n\n## 参考来源\n\n" + "\n".join(
+                        f"- [{index}] [{item['title']}]({item['url']})"
+                        for index, item in enumerate(citations, 1)
+                    )
+                async for progress in review_document(
+                    provider=provider,
+                    settings=settings,
+                    prompt=task_content,
+                    content=document_content,
+                    sources=messages,
+                ):
+                    if await request.is_disconnected():
+                        return
+                    if progress["stage"] == "completed":
+                        document_content = progress["content"]
+                        document_quality = progress["report"]
+                        yield emit("artifact.quality", document_quality)
+                        detail = (
+                            f"文档已完成 {document_quality['revisions']} 次修订；"
+                            + {
+                                "passed": "内容审阅通过。",
+                                "warning": "内容仍有待核实或修改之处。",
+                                "failed": "内容审阅未能完成，已保留完整草稿。",
+                                "skipped": "本次未进行模型内容审阅。",
+                            }[document_quality["model_review"]]
+                        )
+                        if document_quality["render"]["status"] == "passed":
+                            detail += "已完成分页和文字边界检查。"
+                        if document_quality["structural_issues"]:
+                            detail += "；".join(document_quality["structural_issues"])
+                        if document_quality["render"].get("issues"):
+                            detail += "；".join(document_quality["render"]["issues"])
+                        if document_quality.get("warnings"):
+                            detail += "；".join(document_quality["warnings"])
+                        if document_quality["render"].get("reason"):
+                            detail += document_quality["render"]["reason"]
+                        status = "completed"
+                    else:
+                        detail = progress["detail"]
+                        status = "running"
+                    yield emit(
+                        "reasoning.step",
+                        update_step(
+                            "document-review",
+                            "文档检查与修订",
+                            detail,
+                            status,
+                            "tool",
+                        ),
+                    )
+            token_usage = resolved_token_usage(
+                messages, full_response, provider.token_usage, bigmodel.token_usage
+            )
             generated_artifacts = await ArtifactService(session).create_requested(
                 user_id=current_user.id,
                 conversation_id=conversation_id,
-                prompt=payload.content,
-                content=full_response,
+                prompt=task_content,
+                content=document_content,
             )
+            if document_quality is not None:
+                for artifact in generated_artifacts:
+                    if artifact["artifact_type"] == "docx":
+                        artifact["quality"] = document_quality
             if generated_artifacts:
-                yield sse("artifacts", {"items": generated_artifacts})
-            await service.add_message(
-                conversation_id,
-                "assistant",
+                yield emit("artifacts", {"items": generated_artifacts})
+            yield emit(
+                "reasoning.step",
+                update_step(
+                    "answer-completed", "结果汇总", "已生成本次回答。", "completed", "answer"
+                ),
+            )
+            await save_progress(
                 full_response,
-                metadata={
+                {
+                    "delivery_status": "final",
                     "citations": citations,
                     "reasoning_steps": reasoning_steps,
                     "generated_artifacts": generated_artifacts,
                     "token_usage": token_usage,
                 },
             )
-            yield sse(
+            if defer_delivery:
+                yield emit(
+                    "execution.phase",
+                    {"phase": "delivering", "detail": "检查通过，正在展示最终方案。"},
+                )
+                for offset in range(0, len(full_response), 500):
+                    if await request.is_disconnected():
+                        return
+                    yield emit("message.delta", {"text": full_response[offset : offset + 500]})
+            if execution_plan is not None:
+                yield emit("plan.updated", execution_plan.snapshot(paused=True))
+            yield emit(
                 "message.completed",
                 {
                     "message_id": response_id,
                     "finish_reason": "stop",
+                    "stop_reason": stop_reason or "completed",
                     "usage": token_usage,
                     "demo_mode": not settings.deepseek_enabled,
                     "tool_calls": tool_call_count,
@@ -894,28 +1950,55 @@ async def stream_message(
                 },
             )
         except AppError as exc:
+            stop_reason = f"{exc.message}（{exc.code}）"
+            if execution_plan is not None:
+                execution_plan.explanation = f"本次执行中断：{stop_reason}"
+            yield debug("error", error_diagnostic(exc))
+            if full_response:
+                messages.append({"role": "assistant", "content": full_response})
+            error_question = (
+                UserQuestion(
+                    question="要接着补完剩余章节吗？",
+                    reason="这份方案较长，还没有写完整，草稿已经保存。",
+                    problems=["正文尚未输出完整，缺失章节需要从断点补完。"],
+                    recommendation="建议从断点继续，不需要重写已完成部分。",
+                    options=["继续补完方案（推荐）", "我来调整输出范围"],
+                )
+                if exc.code == "MODEL_OUTPUT_TRUNCATED"
+                else UserQuestion(
+                    question="执行发生中断，请选择继续重试，或输入补充说明。",
+                    reason=stop_reason,
+                    options=["从检查点继续重试", "补充说明后继续"],
+                )
+            )
+            interrupt = await pause_for_user(
+                error_question,
+                "error",
+                full_response,
+            )
+            yield emit("execution.interrupted", interrupt)
             if full_response:
                 interrupted_note = (
-                    "\n\n> 本次生成因模型连接波动提前结束，"
-                    "已保留已生成内容，可以继续提问。"
+                    "\n\n> 本次生成因模型连接波动提前结束，已保留已生成内容，可以继续提问。"
                 )
-                full_response = sanitize_assistant_content(full_response) + interrupted_note
-                yield sse("message.delta", {"text": interrupted_note})
+                full_response = sanitize_assistant_content(full_response)
+                if not defer_delivery:
+                    full_response += interrupted_note
+                    yield emit("message.delta", {"text": interrupted_note})
                 interrupted_step = update_step(
                     "generation-interrupted",
                     "生成中断",
-                    "模型连接中断，已保留本次已经生成的内容。",
+                    "方案尚未完整输出，已保存草稿和续写断点。"
+                    if exc.code == "MODEL_OUTPUT_TRUNCATED"
+                    else "模型连接中断，已保留本次已经生成的内容。",
                     "failed",
                     "answer",
                 )
-                yield sse("reasoning.step", interrupted_step)
-                await service.add_message(
-                    conversation_id,
-                    "assistant",
-                    full_response,
-                    metadata={"reasoning_steps": reasoning_steps, "interrupted": True},
-                )
-                yield sse(
+                yield emit("reasoning.step", interrupted_step)
+                await save_progress(full_response, {"interrupted": True, "citations": citations})
+                if execution_plan is not None:
+                    yield emit("plan.updated", execution_plan.snapshot(paused=True))
+                yield emit(
                     "message.completed",
                     {
                         "message_id": response_id,
@@ -926,11 +2009,13 @@ async def stream_message(
                     },
                 )
                 return
-            yield sse(
+            if execution_plan is not None:
+                await save_progress(metadata={"interrupted": True, "citations": citations})
+                yield emit("plan.updated", execution_plan.snapshot(paused=True))
+            yield emit(
                 "error",
                 {
-                    "code": exc.code,
-                    "message": exc.message,
+                    **error_diagnostic(exc),
                     "trace_id": trace_id,
                     "retryable": exc.retryable,
                 },

@@ -3,9 +3,18 @@ import type {
   Citation,
   Conversation,
   ConversationContext,
+  ExecutionPlan,
+  ExecutionInterrupt,
+  CheckpointResume,
   GrowthProfile,
   GeneratedArtifact,
   KnowledgeDocument,
+  InterviewDifficulty,
+  InterviewSession,
+  InterviewReport,
+  InterviewTranscriptEntry,
+  InterviewTrack,
+  InterviewType,
   MemoryItem,
   MemoryType,
   Plan,
@@ -15,11 +24,23 @@ import type {
   WorkMaterial,
 } from '../types/domain';
 import { clearStoredSession, getStoredSession, type StoredSession } from './session';
+import { createExecutionLogger } from './execution-debug';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api/v1';
 
+interface UserResume {
+  filename: string;
+  content: string;
+  summary: string;
+  summary_error?: string | null;
+  has_attachment: boolean;
+  active: boolean;
+  updated_at: string;
+}
+
 interface ApiErrorPayload {
-  error?: { code?: string; message?: string; trace_id?: string };
+  error?: { code?: string; message?: string; trace_id?: string; details?: unknown[] };
+  detail?: unknown;
 }
 
 export class ApiError extends Error {
@@ -28,12 +49,18 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code = 'UNKNOWN_ERROR',
     readonly traceId?: string,
+    readonly details: unknown[] = [],
   ) {
     super(message);
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}, authenticated = true): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  authenticated = true,
+  responseType: 'json' | 'blob' = 'json',
+): Promise<T> {
   const session = getStoredSession();
   const headers = new Headers(init.headers);
   if (!(init.body instanceof FormData)) headers.set('Content-Type', 'application/json');
@@ -48,14 +75,17 @@ async function request<T>(path: string, init: RequestInit = {}, authenticated = 
       window.dispatchEvent(new Event('workplace-agent:unauthorized'));
     }
     throw new ApiError(
-      payload.error?.message ?? '请求失败，请稍后重试',
+      payload.error?.message ??
+        (response.status === 404
+          ? '接口尚未就绪，请更新并重启后端服务'
+          : `请求失败（HTTP ${response.status}），请稍后重试`),
       response.status,
       payload.error?.code,
       payload.error?.trace_id,
     );
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return (responseType === 'blob' ? response.blob() : response.json()) as Promise<T>;
 }
 
 function toSession(payload: {
@@ -142,7 +172,108 @@ function toReport(item: Record<string, unknown>): ProgressReport {
   };
 }
 
+function toInterviewSession(item: Record<string, unknown>): InterviewSession {
+  return {
+    id: String(item.id),
+    appId: String(item.app_id),
+    roomId: String(item.room_id),
+    userId: String(item.user_id),
+    agentUserId: String(item.agent_user_id),
+    taskId: String(item.task_id),
+    token: String(item.token),
+    avatarWssToken: item.avatar_wss_token ? String(item.avatar_wss_token) : undefined,
+    avatarImageUrl: item.avatar_image_url ? String(item.avatar_image_url) : undefined,
+    avatarSpeaker: String(item.avatar_speaker),
+    track: item.track as InterviewTrack,
+    interviewType: item.interview_type as InterviewType,
+    difficulty: item.difficulty as InterviewDifficulty,
+    durationMinutes: Number(item.duration_minutes),
+    enableAvatar: Boolean(item.enable_avatar),
+    interviewPrompt: String(item.interview_prompt),
+    status: item.status as InterviewSession['status'],
+  };
+}
+
+function toInterviewReport(item: Record<string, unknown>): InterviewReport {
+  return {
+    sessionId: String(item.session_id),
+    overallScore: Number(item.overall_score),
+    summary: String(item.summary),
+    scoreItems: (item.score_items as Array<Record<string, unknown>>).map((score) => ({
+      key: score.key as InterviewReport['scoreItems'][number]['key'],
+      label: String(score.label),
+      score: Number(score.score),
+      comment: String(score.comment),
+    })),
+    qaReviews: (item.qa_reviews as Array<Record<string, unknown>>).map((qa) => ({
+      question: String(qa.question),
+      answer: String(qa.answer),
+      score: Number(qa.score),
+      feedback: String(qa.feedback),
+    })),
+    strengths: (item.strengths as string[]) ?? [],
+    improvements: (item.improvements as string[]) ?? [],
+    nextSteps: (item.next_steps as string[]) ?? [],
+    createdAt: new Date(String(item.created_at)).toLocaleString('zh-CN'),
+  };
+}
+
 export const apiClient = {
+  async getInterviewReadiness() {
+    return request<{
+      configured: boolean;
+      avatar_configured: boolean;
+      provider: string;
+      message: string;
+    }>('/interviews/readiness');
+  },
+  async createInterviewSession(values: {
+    track: InterviewTrack;
+    interviewType: InterviewType;
+    difficulty: InterviewDifficulty;
+    durationMinutes: number;
+    enableAvatar: boolean;
+  }) {
+    return toInterviewSession(
+      await request<Record<string, unknown>>('/interviews/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          track: values.track,
+          interview_type: values.interviewType,
+          difficulty: values.difficulty,
+          duration_minutes: values.durationMinutes,
+          enable_avatar: values.enableAvatar,
+        }),
+      }),
+    );
+  },
+  async startInterviewSession(id: string) {
+    return toInterviewSession(
+      await request<Record<string, unknown>>(`/interviews/sessions/${id}:start`, {
+        method: 'POST',
+      }),
+    );
+  },
+  async stopInterviewSession(id: string) {
+    return toInterviewSession(
+      await request<Record<string, unknown>>(`/interviews/sessions/${id}:stop`, {
+        method: 'POST',
+      }),
+    );
+  },
+  async generateInterviewReport(id: string, answers: InterviewTranscriptEntry[]) {
+    return toInterviewReport(
+      await request<Record<string, unknown>>(`/interviews/sessions/${id}:report`, {
+        method: 'POST',
+        body: JSON.stringify({
+          answers: answers.map((answer) => ({
+            text: answer.text,
+            recorded_at_seconds: answer.recordedAtSeconds,
+          })),
+        }),
+      }),
+    );
+  },
   async register(values: { email: string; password: string; displayName: string }) {
     const payload = await request<{
       access_token: string;
@@ -241,6 +372,10 @@ export const apiClient = {
           kind: ReasoningStep['kind'];
           elapsed_ms?: number;
         }>;
+        execution_plan?: ExecutionPlan | null;
+        execution_interrupt?: ExecutionInterrupt | null;
+        delivery_status?: ChatMessage['deliveryStatus'];
+        draft_content?: string | null;
         attachments: Array<{
           id: string;
           title: string;
@@ -293,6 +428,10 @@ export const apiClient = {
         kind: step.kind,
         elapsedMs: Number(step.elapsed_ms ?? 0),
       })),
+      executionPlan: item.execution_plan ?? undefined,
+      executionInterrupt: item.execution_interrupt ?? undefined,
+      deliveryStatus: item.delivery_status,
+      draftContent: item.draft_content ?? undefined,
       attachments: item.attachments.map((attachment) => ({
         id: attachment.id,
         title: attachment.title,
@@ -329,9 +468,14 @@ export const apiClient = {
     attachmentIds: string[],
     handlers: {
       onStarted: (id: string) => void;
+      onPlan?: (plan: ExecutionPlan) => void;
+      onInterrupt?: (interrupt: ExecutionInterrupt) => void;
       onDelta: (text: string) => void;
+      onReplace?: (text: string) => void;
+      onPhase?: (phase: string, detail: string) => void;
       onToolStarted?: (tool: string) => void;
       onToolCompleted?: (tool: string, resultCount: number) => void;
+      onToolFailed?: (tool: string, reason: string) => void;
       onCitations?: (items: Citation[]) => void;
       onImages?: (items: NonNullable<ChatMessage['generatedImages']>) => void;
       onArtifacts?: (items: NonNullable<ChatMessage['generatedArtifacts']>) => void;
@@ -340,8 +484,12 @@ export const apiClient = {
       onUsage?: (usage: NonNullable<ChatMessage['tokenUsage']>) => void;
     },
     signal: AbortSignal,
+    usePlan = false,
+    resume?: CheckpointResume,
   ) {
     const session = getStoredSession();
+    const log = createExecutionLogger(conversationId);
+    log('request', { content, attachment_ids: attachmentIds, use_plan: usePlan });
     const response = await fetch(
       `${API_BASE_URL}/conversations/${conversationId}/messages:stream`,
       {
@@ -350,16 +498,47 @@ export const apiClient = {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${session?.accessToken ?? ''}`,
         },
-        body: JSON.stringify({ content, attachment_ids: attachmentIds }),
+        body: JSON.stringify({
+          content,
+          attachment_ids: attachmentIds,
+          use_plan: usePlan,
+          resume_checkpoint_id: resume?.checkpointId,
+          resume_action: resume?.action,
+        }),
         signal,
       },
-    );
-    if (!response.ok || !response.body) throw new ApiError('发送消息失败', response.status);
+    ).catch((error: unknown) => {
+      if (!signal.aborted)
+        log('connection.error', {
+          message: error instanceof Error ? error.message : String(error),
+          phase: '发送请求',
+        });
+      throw error;
+    });
+    if (!response.ok || !response.body) {
+      const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+      log('http.error', { status: response.status, ...payload.error, validation: payload.detail });
+      throw new ApiError(
+        payload.error?.message ?? `发送消息失败（HTTP ${response.status}）`,
+        response.status,
+        payload.error?.code,
+        payload.error?.trace_id,
+        payload.error?.details,
+      );
+    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let completed = false;
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        if (!signal.aborted)
+          log('connection.error', {
+            message: error instanceof Error ? error.message : String(error),
+            phase: '读取响应',
+          });
+        throw error;
+      });
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const blocks = buffer.split('\n\n');
@@ -369,7 +548,22 @@ export const apiClient = {
         const dataText = block.match(/^data: (.+)$/m)?.[1];
         if (!event || !dataText) continue;
         const data = JSON.parse(dataText) as Record<string, unknown>;
-        if (event === 'message.started') handlers.onStarted(String(data.message_id));
+        if (event === 'message.started') {
+          log(event, data);
+          handlers.onStarted(String(data.message_id));
+        }
+        if (event === 'agent.debug') log(String(data.kind), data);
+        if (
+          event.startsWith('tool.') ||
+          event === 'plan.updated' ||
+          event === 'agent.limit_reached'
+        )
+          log(event, data);
+        if (event === 'plan.updated') handlers.onPlan?.(data as unknown as ExecutionPlan);
+        if (event === 'execution.interrupted') {
+          log(event, data);
+          handlers.onInterrupt?.(data as unknown as ExecutionInterrupt);
+        }
         if (event === 'context.usage') {
           const context = {
             messageCount: Number(data.message_count ?? 0),
@@ -381,6 +575,7 @@ export const apiClient = {
           handlers.onContextUsage?.(context);
         }
         if (event === 'context.prompt_debug') {
+          log('context', data);
           const breakdown = data.breakdown as Record<string, unknown>;
           console.groupCollapsed('[Prompt Debug] 本轮发送给 AI 的提示词');
           console.info('Token 构成', {
@@ -394,7 +589,15 @@ export const apiClient = {
           console.groupEnd();
         }
         if (event === 'message.delta') handlers.onDelta(String(data.text));
+        if (event === 'message.replaced') handlers.onReplace?.(String(data.text));
+        if (event === 'execution.phase') {
+          log(event, data);
+          handlers.onPhase?.(String(data.phase), String(data.detail));
+        }
         if (event === 'tool.started') handlers.onToolStarted?.(String(data.tool));
+        if (event === 'tool.failed')
+          handlers.onToolFailed?.(String(data.tool), String(data.message ?? data.code));
+        if (event === 'message.completed') completed = true;
         if (event === 'tool.completed') {
           handlers.onToolCompleted?.(String(data.tool), Number(data.result_count ?? 0));
         }
@@ -429,6 +632,7 @@ export const apiClient = {
           handlers.onArtifacts?.(items);
         }
         if (event === 'reasoning.step') {
+          log(event, data);
           handlers.onReasoningStep?.({
             id: String(data.id),
             title: String(data.title),
@@ -453,8 +657,29 @@ export const apiClient = {
             estimated: Boolean(usage.estimated),
           });
         }
-        if (event === 'error') throw new ApiError(String(data.message), 502, String(data.code));
+        if (event === 'error') {
+          log(event, data);
+          throw new ApiError(
+            String(data.message),
+            Number(data.status ?? 502),
+            String(data.code),
+            String(data.trace_id ?? ''),
+            (data.details as unknown[]) ?? [],
+          );
+        }
       }
+    }
+    if (!completed && !signal.aborted) {
+      log('connection.error', {
+        code: 'STREAM_INTERRUPTED',
+        message: '响应在任务完成前结束',
+        phase: '读取响应',
+      });
+      throw new ApiError(
+        '响应连接提前结束，已保存的任务计划可以继续执行',
+        502,
+        'STREAM_INTERRUPTED',
+      );
     }
   },
   async downloadArtifact(artifact: GeneratedArtifact) {
@@ -479,6 +704,26 @@ export const apiClient = {
     link.click();
     link.remove();
     URL.revokeObjectURL(blobUrl);
+  },
+  getResumeAttachment(signal?: AbortSignal) {
+    return request<Blob>('/resume/attachment', { signal }, true, 'blob');
+  },
+  getResume() {
+    return request<UserResume | null>('/resume');
+  },
+  uploadResume(file: File) {
+    const body = new FormData();
+    body.append('file', file);
+    return request<UserResume>('/resume', { method: 'PUT', body });
+  },
+  regenerateResumeSummary() {
+    return request<UserResume>('/resume:regenerate-summary', { method: 'POST' });
+  },
+  setResumeActive(active: boolean) {
+    return request('/resume', { method: 'PATCH', body: JSON.stringify({ active }) });
+  },
+  deleteResume() {
+    return request<void>('/resume', { method: 'DELETE' });
   },
   async getMemories() {
     const items = await request<Array<Record<string, unknown>>>('/memories');

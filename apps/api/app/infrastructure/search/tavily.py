@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from app.core.config import Settings
+from app.core.diagnostics import safe_debug
 from app.core.errors import AppError
 from app.ports.web_search import SearchResult, WebSearchResponse
 
@@ -42,7 +43,11 @@ class TavilyWebSearchProvider:
                     "WEB_SEARCH_PROVIDER_ERROR",
                     "联网搜索服务暂时不可用",
                     status_code=502,
-                    details=[{"provider_status": response.status_code}],
+                    details=[
+                        safe_debug(
+                            {"provider_status": response.status_code, "body": response.text[:4000]}
+                        )
+                    ],
                     retryable=response.status_code in {408, 429, 500, 502, 503, 504},
                 )
             body = response.json()
@@ -53,6 +58,12 @@ class TavilyWebSearchProvider:
                 "WEB_SEARCH_PROVIDER_ERROR",
                 "连接联网搜索服务失败，请稍后重试",
                 status_code=502,
+                details=[
+                    {
+                        "exception_type": type(exc).__name__,
+                        "timeout_seconds": self.settings.web_search_timeout_seconds,
+                    }
+                ],
                 retryable=True,
             ) from exc
 

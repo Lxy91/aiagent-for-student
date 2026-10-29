@@ -30,9 +30,7 @@ def upgrade() -> None:
         sa.Column("binary_content", binary_type, nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(
-            ["conversation_id"], ["conversations.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"], ondelete="CASCADE"),
     )
     op.create_index("ix_generated_artifacts_user_id", "generated_artifacts", ["user_id"])
     op.create_index(
@@ -41,9 +39,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_generated_artifacts_artifact_type", "generated_artifacts", ["artifact_type"]
     )
-    op.create_index(
-        "ix_generated_artifacts_created_at", "generated_artifacts", ["created_at"]
-    )
+    op.create_index("ix_generated_artifacts_created_at", "generated_artifacts", ["created_at"])
     op.create_index(
         "ix_generated_artifacts_user_created",
         "generated_artifacts",

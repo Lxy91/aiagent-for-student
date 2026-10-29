@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><title>投递助手本地验证</title>
+  <body>
+    <h1>本地模拟招聘表单</h1>
+    <form
+      onsubmit="
+        event.preventDefault();
+        window.submitted = true;
+      "
+    >
+      <label>姓名<input id="name" /></label>
+      <label>手机号<input id="phone" type="tel" /></label>
+      <label>邮箱<input id="email" type="email" value="keep@example.com" /></label>
+      <label>学校<input id="school" /></label>
+      <label>专业<input id="major" /></label>
+      <label
+        >学历<select id="degree">
+          <option value="">请选择</option>
+          <option value="bachelor">本科</option>
+          <option value="master">硕士</option>
+        </select></label
+      >
+      <label>毕业时间<input id="graduation" type="month" /></label>
+      <label>自我介绍<textarea id="intro"></textarea></label>
+      <label>紧急联系人姓名<input id="emergency" /></label>
+      <label>密码<input id="secret" type="password" /></label>
+      <label>验证码<input id="code" /></label>
+      <label>隐藏字段<input id="hidden" type="hidden" /></label>
+      <button type="submit">投递</button>
+    </form>
+    <script src="../form-filler.js"></script>
+  </body>
+</html>

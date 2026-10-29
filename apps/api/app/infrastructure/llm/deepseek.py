@@ -5,12 +5,16 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.diagnostics import safe_debug
 from app.core.errors import AppError
 
 
 class DeepSeekProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.chat_output_limit = settings.chat_completion_max_tokens
+        self.last_finish_reason: str | None = None
+        self.last_selection_finish_reason: str | None = None
         self.token_usage = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -24,6 +28,7 @@ class DeepSeekProvider:
             self.token_usage[key] += int(usage.get(key) or 0)
 
     async def stream_chat(self, messages: Sequence[dict[str, Any]]) -> AsyncIterator[str]:
+        self.last_finish_reason = None
         if not self.settings.deepseek_enabled:
             async for chunk in self._demo_stream(messages):
                 yield chunk
@@ -40,7 +45,7 @@ class DeepSeekProvider:
             "thinking": {"type": "disabled"},
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": self.settings.chat_completion_max_tokens,
+            "max_tokens": self.chat_output_limit,
         }
         timeout = httpx.Timeout(self.settings.deepseek_timeout_seconds, connect=10.0)
         try:
@@ -65,7 +70,9 @@ class DeepSeekProvider:
                         break
                     chunk = json.loads(data)
                     self._record_usage(chunk.get("usage"))
-                    content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                    choice = (chunk.get("choices") or [{}])[0]
+                    self.last_finish_reason = choice.get("finish_reason") or self.last_finish_reason
+                    content = choice.get("delta", {}).get("content")
                     if content:
                         yield content
         except AppError:
@@ -100,6 +107,7 @@ class DeepSeekProvider:
             "messages": list(messages),
             "thinking": {"type": "disabled"},
             "stream": False,
+            "max_tokens": self.chat_output_limit,
         }
         if tools:
             payload["tools"] = tools
@@ -122,11 +130,18 @@ class DeepSeekProvider:
                     "MODEL_PROVIDER_ERROR",
                     "模型工具规划暂时不可用",
                     status_code=502,
-                    details=[{"provider_status": response.status_code}],
+                    details=[
+                        safe_debug(
+                            {"provider_status": response.status_code, "body": response.text[:4000]}
+                        )
+                    ],
                     retryable=response.status_code in {408, 429, 500, 502, 503, 504},
                 )
             body = response.json()
             self._record_usage(body.get("usage"))
+            self.last_selection_finish_reason = (body.get("choices") or [{}])[0].get(
+                "finish_reason"
+            )
             message = body.get("choices", [{}])[0].get("message") or {}
             calls = message.get("tool_calls") or []
             return message or None, calls

@@ -50,3 +50,16 @@ pytest
 ```
 
 前端已完成真实 API 联调，包括账号认证、SSE 流式对话、记忆、知识库和行动计划。
+
+## 独立浏览器插件
+
+右上角「应用」提供轻量插件目录和安装包。投递填表助手的代码、依赖、模型配置与会话资料位于独立的 `apps/extension`，本体只分发静态安装包，后端不增加填表业务接口。
+
+```powershell
+pnpm plugin:test
+pnpm plugin:build
+```
+
+打包后可在应用市场下载 ZIP，或直接在 Chrome/Edge 开发者模式加载 `apps/extension/dist`。本体账号为可选连接。插件支持生成、导入和编辑 Excel 资料表，并使用 AI 将表格字段匹配到页面；简历自动生成资料通过独立本机服务读取 `apps/extension/.env`，使用 `pnpm plugin:serve` 启动。从记忆中心导入为可选连接。
+
+完整安装说明、权限和兼容范围见 [插件说明](apps/extension/README.md)。

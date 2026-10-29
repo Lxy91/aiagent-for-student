@@ -1,0 +1,25 @@
+{
+  "name": "@workplace-agent/application-assistant",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:browser": "node tests/browser-check.mjs",
+    "model:serve": "node service.mjs"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "mammoth": "^1.10.0",
+    "pdfjs-dist": "^5.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "fflate": "^0.8.2",
+    "playwright-core": "^1.64.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

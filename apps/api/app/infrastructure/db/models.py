@@ -68,9 +68,7 @@ class MessageModel(Base):
 
 class GeneratedArtifactModel(Base):
     __tablename__ = "generated_artifacts"
-    __table_args__ = (
-        Index("ix_generated_artifacts_user_created", "user_id", "created_at"),
-    )
+    __table_args__ = (Index("ix_generated_artifacts_user_created", "user_id", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -81,9 +79,7 @@ class GeneratedArtifactModel(Base):
     artifact_type: Mapped[str] = mapped_column(String(20), index=True)
     mime_type: Mapped[str] = mapped_column(String(100))
     size_bytes: Mapped[int] = mapped_column(Integer)
-    binary_content: Mapped[bytes] = mapped_column(
-        LargeBinary().with_variant(LONGBLOB(), "mysql")
-    )
+    binary_content: Mapped[bytes] = mapped_column(LargeBinary().with_variant(LONGBLOB(), "mysql"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
 
 
@@ -125,6 +121,63 @@ class KnowledgeDocumentModel(Base):
     size_bytes: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
+class JobPostingModel(Base):
+    """Normalized public job data used by recruitment search and RAG retrieval."""
+
+    __tablename__ = "job_postings"
+    __table_args__ = (
+        Index("ux_job_postings_source_external", "source", "external_id", unique=True),
+        Index("ix_job_postings_city_status", "city", "status"),
+        Index("ix_job_postings_last_seen", "last_seen_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source: Mapped[str] = mapped_column(String(40), default="boss", index=True)
+    external_id: Mapped[str] = mapped_column(String(160))
+    source_url: Mapped[str] = mapped_column(String(1000))
+    title: Mapped[str] = mapped_column(String(255), index=True)
+    company: Mapped[str] = mapped_column(String(255), default="")
+    city: Mapped[str] = mapped_column(String(80), default="", index=True)
+    district: Mapped[str] = mapped_column(String(120), default="")
+    education: Mapped[str] = mapped_column(String(80), default="", index=True)
+    experience: Mapped[str] = mapped_column(String(80), default="", index=True)
+    salary_text: Mapped[str] = mapped_column(String(120), default="")
+    salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requirements: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
+    benefits: Mapped[list] = mapped_column(JSON, default=list)
+    work_schedule: Mapped[str] = mapped_column(String(500), default="")
+    description: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    searchable_text: Mapped[str] = mapped_column(
+        Text().with_variant(LONGTEXT(), "mysql"), default=""
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    raw_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    chunks: Mapped[list["JobChunkModel"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class JobChunkModel(Base):
+    __tablename__ = "job_chunks"
+    __table_args__ = (Index("ux_job_chunks_job_ordinal", "job_id", "ordinal", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"))
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
+    job: Mapped[JobPostingModel] = relationship(back_populates="chunks")
 
 
 class PlanDraftModel(Base):
@@ -357,3 +410,24 @@ class ProgressReportModel(Base):
     sections: Mapped[dict] = mapped_column(JSON)
     source_refs: Mapped[list] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
+
+
+class ResumeModel(Base):
+    __tablename__ = "user_resumes"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    attachment_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    binary_content: Mapped[bytes | None] = mapped_column(
+        LargeBinary().with_variant(LONGBLOB(), "mysql"), nullable=True, deferred=True
+    )
+    content: Mapped[str] = mapped_column(Text)
+    summary_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary_version: Mapped[int] = mapped_column(Integer, default=0)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+
+    @property
+    def has_attachment(self) -> bool:
+        return self.attachment_size is not None

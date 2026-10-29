@@ -78,12 +78,8 @@ class GrowthService:
     ) -> WorkMaterialResponse:
         if len(content) > self.max_upload_bytes:
             raise AppError("FILE_TOO_LARGE", "文件不能超过 20 MB", status_code=413)
-        extension, material_type = validate_material_upload(
-            filename, mime_type, content, purpose
-        )
+        extension, material_type = validate_material_upload(filename, mime_type, content, purpose)
 
-        # TODO(multimodal-privacy): Run OCR/privacy detection on images before they can be
-        # attached to a chat and sent to an external vision provider.
         extracted = await asyncio.to_thread(self._extract_text, extension, content)
         redacted, privacy_status = self._redact(extracted)
         status = "ready" if redacted else "needs_confirmation"
@@ -325,11 +321,24 @@ class GrowthService:
             return GrowthService._extract_pdf(content)
         if extension == ".docx":
             return GrowthService._extract_docx(content)
+        if extension in {".png", ".jpg", ".jpeg"}:
+            return GrowthService._extract_image(content)
         if extension in {".mp3", ".wav", ".m4a"}:
             # TODO(multimodal-audio): Add speech-to-text transcription before audio
             # attachments are advertised as readable chat context.
             return ""
         return ""
+
+    @staticmethod
+    def _extract_image(content: bytes) -> str:
+        """Recognize screenshot text locally so privacy checks run before vision calls."""
+        try:
+            with _OCR_LOCK:
+                result = _ocr_engine()(content)
+            return "\n".join(result.txts or ()).strip()
+        except Exception:
+            logger.exception("OCR failed for uploaded image")
+            return ""
 
     @staticmethod
     def _extract_docx(content: bytes) -> str:
@@ -345,14 +354,11 @@ class GrowthService:
                     sorted(
                         name
                         for name in names
-                        if name.startswith(("word/header", "word/footer"))
-                        and name.endswith(".xml")
+                        if name.startswith(("word/header", "word/footer")) and name.endswith(".xml")
                     )
                 )
                 part_names.extend(
-                    name
-                    for name in ("word/footnotes.xml", "word/endnotes.xml")
-                    if name in names
+                    name for name in ("word/footnotes.xml", "word/endnotes.xml") if name in names
                 )
 
                 sections: list[str] = []
@@ -368,9 +374,7 @@ class GrowthService:
                             for descendant in paragraph.iter(paragraph_tag)
                         ):
                             continue
-                        text = "".join(
-                            node.text or "" for node in paragraph.iter(text_tag)
-                        ).strip()
+                        text = "".join(node.text or "" for node in paragraph.iter(text_tag)).strip()
                         if text:
                             sections.append(text)
                 return "\n".join(sections).strip()
@@ -518,10 +522,13 @@ class GrowthService:
         self, user_id: UUID, material: WorkMaterialModel, text: str
     ) -> MeetingMinutesModel:
         if not text:
-            summary = (
-                "材料已接收；当前未提取到可读取文字，且未配置音频/图像识别，"
-                "请补充文字纪要后再确认事实。"
-            )
+            if material.material_type == "image":
+                summary = "截图已接收，但未识别到可读取文字，请换用更清晰的截图或补充文字纪要。"
+            else:
+                summary = (
+                    "材料已接收；当前未提取到可读取文字，且未配置音频转写，"
+                    "请补充文字纪要后再确认事实。"
+                )
             return MeetingMinutesModel(
                 id=str(uuid4()),
                 user_id=str(user_id),

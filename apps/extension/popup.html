@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>启程 · 投递填表助手</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span class="brand">启程</span>
+      <div>
+        <h1>投递填表助手</h1>
+        <p>独立维护资料，在投递页面确认填入</p>
+      </div>
+    </header>
+    <p id="status" role="status" aria-live="polite">正在读取会话资料…</p>
+    <section id="workbook-section">
+      <h2>Excel 资料表</h2>
+      <p class="hint">
+        解析简历、从启程导入、手工补充，都汇总到这张资料表。下次填写直接导入你编辑后的 Excel。
+      </p>
+      <label id="workbook-file-label" for="workbook-file">导入资料表</label>
+      <div class="file-picker">
+        <button id="choose-workbook" type="button" class="secondary">选择 Excel</button>
+        <span id="workbook-filename" aria-live="polite">未导入资料表</span>
+        <input
+          id="workbook-file"
+          type="file"
+          accept=".xlsx"
+          aria-labelledby="workbook-file-label"
+          hidden
+        />
+      </div>
+      <button id="export-workbook" type="button" class="secondary">导出 Excel / 空白模板</button>
+      <p id="table-status" class="hint"></p>
+      <button id="split-experiences" type="button" class="secondary">
+        将表格中的整段经历拆成明细
+      </button>
+    </section>
+    <section>
+      <h2>从简历生成资料表</h2>
+      <label id="resume-file-label" for="resume-file">选择简历文件</label>
+      <div class="file-picker">
+        <button id="choose-resume" type="button" class="secondary">选择文件</button>
+        <span id="resume-filename" aria-live="polite">未选择文件</span>
+        <input
+          id="resume-file"
+          type="file"
+          accept=".pdf,.docx,.txt,.md"
+          aria-labelledby="resume-file-label"
+          hidden
+        />
+      </div>
+      <p class="hint">文件在本地读取。支持文字版 PDF、DOCX、TXT、Markdown，最大 20 MB。</p>
+      <details>
+        <summary>查看或粘贴简历文字</summary>
+        <label>简历文字<textarea id="resume-text" rows="6" maxlength="30000"></textarea></label>
+      </details>
+      <p id="source" class="hint"></p>
+      <button id="generate" type="button">解析简历并导出 Excel</button>
+      <p class="hint">
+        生成时通过本地服务将简历文字发送至 .env
+        中配置的模型服务，请保持面板打开。也可直接编辑下方资料。
+      </p>
+    </section>
+    <section id="model-settings">
+      <h2>本地模型服务</h2>
+      <p class="hint">模型地址、名称和 Key 从插件本地服务的 .env 文件读取。</p>
+      <p id="model-status" class="hint">生成资料前请启动本地模型服务。</p>
+      <button id="check-model" type="button" class="secondary">检查连接</button>
+    </section>
+    <details id="settings">
+      <summary>从启程导入（可选）</summary>
+      <label
+        >启程 API 地址<input
+          id="api-base"
+          type="url"
+          value="http://localhost:8000/api/v1"
+          spellcheck="false"
+      /></label>
+      <label
+        >启程网页地址<input
+          id="app-url"
+          type="url"
+          value="http://localhost:5173/memory"
+          spellcheck="false"
+      /></label>
+      <form id="login-form">
+        <label>邮箱<input id="email" type="email" autocomplete="username" required /></label>
+        <label
+          >密码<input id="password" type="password" autocomplete="current-password" required
+        /></label>
+        <button type="submit">连接启程账号</button>
+      </form>
+      <div id="account" hidden>
+        <p id="user-name"></p>
+        <button id="sync" type="button">从启程简历一键生成 Excel</button>
+        <button id="logout" type="button" class="text-button">断开连接</button>
+      </div>
+      <p>
+        <a id="open-app" href="http://localhost:5173/memory" target="_blank" rel="noreferrer"
+          >打开记忆中心</a
+        >
+      </p>
+      <p class="hint">仅在点击导入时读取已有简历，聊天与面试开关不受影响。</p>
+    </details>
+    <section id="profile-section">
+      <div class="row">
+        <h2>当前表格资料</h2>
+        <button id="clear-data" type="button" class="text-button">清除资料</button>
+      </div>
+      <p class="hint">
+        可直接填写或修改资料，并取消不想填入的字段。编辑后可导出 Excel 长期保存，下次再导入。
+      </p>
+      <details>
+        <summary>查看和编辑表格资料</summary>
+        <div id="profile-fields"></div>
+      </details>
+      <p id="profile-notes" class="hint"></p>
+    </section>
+    <section id="plan-section" hidden>
+      <h2>核对填入位置</h2>
+      <p id="target-site" class="hint"></p>
+      <div id="plan-fields"></div>
+    </section>
+    <div class="action-dock">
+      <p id="operation-feedback" aria-live="polite" hidden></p>
+      <label id="experience-choice" hidden
+        >本次填写的经历<select id="experience-record"></select
+      ></label>
+      <p id="experience-hint" class="hint"></p>
+      <label class="checkbox-line"
+        ><input id="overwrite" type="checkbox" />允许覆盖页面已有内容</label
+      >
+      <button id="scan" type="button">用表格资料让 AI 匹配当前页</button>
+      <button id="fill" type="button" hidden>确认填入选中的字段</button>
+    </div>
+    <footer>
+      仅在你操作时读取当前页；不会点击保存或投递。多段经历请逐条选择，填写后由你保存或新增下一条。自定义日期控件需手动核对。
+    </footer>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

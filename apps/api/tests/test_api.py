@@ -1,6 +1,8 @@
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from zipfile import ZipFile
 
+import pytest
 from docx import Document
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
@@ -26,6 +28,7 @@ from app.modules.artifacts.service import (
 )
 from app.modules.chat.api import (
     artifact_execution_narrative,
+    build_runtime_context,
     requires_image_generation,
     requires_web_search,
 )
@@ -67,6 +70,17 @@ def test_health_and_ready(client: TestClient) -> None:
     ready = client.get("/api/v1/ready")
     assert ready.status_code == 200
     assert ready.json()["dependencies"]["deepseek"] == "demo-mode"
+
+
+def test_runtime_context_is_stable_within_each_shanghai_calendar_day() -> None:
+    context = build_runtime_context(datetime(2026, 10, 8, 16, 30, tzinfo=UTC))
+    same_day_context = build_runtime_context(datetime(2026, 10, 8, 20, 45, tzinfo=UTC))
+
+    assert "当前日期：2026-10-09" in context
+    assert "当前时间：" not in context
+    assert "Asia/Shanghai (UTC+08:00)" in context
+    assert "不得依赖模型训练知识猜测当前日期" in context
+    assert same_day_context == context
 
 
 def test_history_token_estimator_handles_chinese_and_latin_text() -> None:
@@ -289,16 +303,17 @@ def test_attachment_edit_routing_requires_edit_intent_and_editable_file() -> Non
     ]
     assert editable_attachments("这个补全发给我", attachments) == attachments
     assert editable_attachments("总结一下这个文件", attachments) == []
-    assert editable_attachments(
-        "修改一下这张图片",
-        [{**attachments[0], "title": "screenshot.png", "material_type": "image"}],
-    ) == []
+    assert (
+        editable_attachments(
+            "修改一下这张图片",
+            [{**attachments[0], "title": "screenshot.png", "material_type": "image"}],
+        )
+        == []
+    )
     assert allows_unfilled_fields("不清楚的地方可以先不填写")
     assert allows_unfilled_fields("不知道的内容留空即可")
     assert not allows_unfilled_fields("缺少内容，请先问我")
-    assert requested_docx_formatting("把字体颜色统一一下", "报告.docx") == {
-        "font_color": "000000"
-    }
+    assert requested_docx_formatting("把字体颜色统一一下", "报告.docx") == {"font_color": "000000"}
     assert requested_docx_formatting("把字体颜色统一一下", "报告.xlsx") == {}
 
 
@@ -685,18 +700,35 @@ def test_web_search_tool_returns_sources_and_audit(
     assert runs.json()[0]["input_summary"]["query"] == "2026 校招最新信息"
 
 
+@pytest.mark.parametrize(
+    "rounds,calls_per_round,fail_first", [(1, 1, False), (5, 4, True), (12, 1, False)]
+)
 def test_chat_stream_emits_tool_events_and_persists_citations(
-    client: TestClient, auth_headers: dict[str, str], monkeypatch
+    client: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch,
+    caplog,
+    rounds: int,
+    calls_per_round: int,
+    fail_first: bool,
 ) -> None:
+    import logging
+
     from app.core.config import Settings
     from app.infrastructure.llm.deepseek import DeepSeekProvider
 
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
     selections = 0
 
     async def fake_select(self, messages, tools, *, force_tool_name=None, allow_tool_calls=True):
         nonlocal selections
-        del self, messages, tools, force_tool_name
-        if not allow_tool_calls or selections:
+        del self, tools, force_tool_name
+        if selections:
+            # Every advertised call must have a result before the next model request.
+            previous = next(m for m in reversed(messages) if m.get("tool_calls"))
+            result_ids = {m.get("tool_call_id") for m in messages if m["role"] == "tool"}
+            assert all(c["id"] in result_ids for c in previous["tool_calls"])
+        if not allow_tool_calls or selections >= rounds:
             return {
                 "role": "assistant",
                 "content": "根据检索结果，建议优先查看官方就业信息 [1]。",
@@ -710,10 +742,19 @@ def test_chat_stream_emits_tool_events_and_persists_citations(
                 "arguments": '{"query":"2026 校招最新政策","max_results":3}',
             },
         }
-        return {"role": "assistant", "content": None, "tool_calls": [call]}, [call]
+        calls = [{**call, "id": f"call-{selections}-{i}"} for i in range(calls_per_round)]
+        return {"role": "assistant", "content": None, "tool_calls": calls}, calls
+
+    search_count = 0
 
     async def fake_search(self, query: str, *, max_results: int) -> WebSearchResponse:
+        nonlocal search_count
         del self, max_results
+        search_count += 1
+        if fail_first and search_count == 1:
+            from app.core.errors import AppError
+
+            raise AppError("TOOL_TIMEOUT", "search timed out", status_code=504, retryable=True)
         return WebSearchResponse(
             query=query,
             results=[
@@ -767,6 +808,12 @@ def test_chat_stream_emits_tool_events_and_persists_citations(
     assert "event: reasoning.step" in response.text
     assert "event: citations" in response.text
     assert "https://example.edu.cn/jobs" in response.text
+    assert selections == rounds
+    assert search_count == rounds * calls_per_round
+    assert ("event: tool.failed" in response.text) == fail_first
+    assert ("event: agent.limit_reached" in response.text) == (rounds == 12)
+    assert "event=agent.iteration" in caplog.text
+    assert "event=message.completed" in caplog.text
     assert "校招政策的最新变化" in response.text
     assert "目标、时效性要求和当前可用工具" not in response.text
     assert "DSML" not in response.text
@@ -1103,7 +1150,108 @@ def test_v03_non_text_multimodal_input_does_not_invent_content(
     material = response.json()
     assert material["status"] == "needs_confirmation"
     assert material["minutes"]["action_items"] == []
-    assert "未配置音频/图像识别" in material["minutes"]["summary"]
+    assert "未识别到可读取文字" in material["minutes"]["summary"]
+
+
+def test_v03_screenshot_ocr_creates_minutes_and_redacts_before_external_use(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        GrowthService,
+        "_extract_image",
+        staticmethod(
+            lambda content: (
+                "需求评审截图\n"
+                "行动项：小林负责周五前完成原型。\n"
+                "待确认：是否需要增加移动端？\n"
+                "联系 intern@example.com"
+            )
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/materials",
+        headers=auth_headers,
+        files={"file": ("review.png", VALID_PNG_BYTES, "image/png")},
+        data={"purpose": "meeting"},
+    )
+
+    assert response.status_code == 202
+    material = response.json()
+    assert material["status"] == "ready"
+    assert material["privacy_status"] == "redacted"
+    assert "intern@example.com" not in material["content_excerpt"]
+    assert "[邮箱已脱敏]" in material["content_excerpt"]
+    assert material["minutes"]["action_items"] == ["行动项：小林负责周五前完成原型。"]
+    assert "移动端" in material["minutes"]["pending_facts"][0]
+
+
+def test_v03_redacted_screenshot_uses_ocr_text_instead_of_external_vision(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch
+) -> None:
+    from app.core.config import Settings
+    from app.infrastructure.llm.bigmodel import BigModelProvider
+    from app.infrastructure.llm.deepseek import DeepSeekProvider
+
+    captured_messages: list[dict] = []
+    vision_called = False
+
+    async def fake_select(self, messages, tools, *, force_tool_name=None, allow_tool_calls=True):
+        del self, messages, tools, force_tool_name, allow_tool_calls
+        return {"role": "assistant", "content": "使用已脱敏的 OCR 文字。"}, []
+
+    async def fake_narrative(self, messages, *, max_tokens=2400):
+        del self, messages, max_tokens
+        return {
+            "understanding": "用户希望总结截图。",
+            "next_action": "我会使用已脱敏的 OCR 文字。",
+        }
+
+    async def fake_chat(self, messages):
+        del self
+        captured_messages.extend(messages)
+        yield "已根据截图文字完成总结。"
+
+    async def fake_vision(self, messages, images):
+        nonlocal vision_called
+        del self, messages, images
+        vision_called = True
+        yield "不应调用"
+
+    monkeypatch.setattr(Settings, "deepseek_enabled", property(lambda self: True))
+    monkeypatch.setattr(Settings, "bigmodel_enabled", property(lambda self: True))
+    monkeypatch.setattr(DeepSeekProvider, "select_tool_calls", fake_select)
+    monkeypatch.setattr(DeepSeekProvider, "complete_json", fake_narrative)
+    monkeypatch.setattr(DeepSeekProvider, "stream_chat", fake_chat)
+    monkeypatch.setattr(BigModelProvider, "stream_vision", fake_vision)
+    monkeypatch.setattr(
+        GrowthService,
+        "_extract_image",
+        staticmethod(lambda content: "联系人 intern@example.com，行动项：完成复盘。"),
+    )
+
+    material = client.post(
+        "/api/v1/materials",
+        headers=auth_headers,
+        files={"file": ("private.png", VALID_PNG_BYTES, "image/png")},
+        data={"purpose": "conversation"},
+    ).json()
+    conversation = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "截图复盘", "mode": "standard"},
+    ).json()
+    response = client.post(
+        f"/api/v1/conversations/{conversation['id']}/messages:stream",
+        headers=auth_headers,
+        json={"content": "总结这张截图", "attachment_ids": [material["id"]]},
+    )
+
+    assert response.status_code == 200
+    assert not vision_called
+    serialized_messages = str(captured_messages)
+    assert "intern@example.com" not in serialized_messages
+    assert "[邮箱已脱敏]" in serialized_messages
 
 
 def test_material_upload_rejects_spoofed_type_invalid_purpose_and_empty_file(
@@ -1206,6 +1354,11 @@ def test_v03_chat_accepts_multiple_attachment_types_as_grounded_context(
     monkeypatch.setattr(DeepSeekProvider, "select_tool_calls", fake_select)
     monkeypatch.setattr(DeepSeekProvider, "complete_json", fake_narrative)
     monkeypatch.setattr(BigModelProvider, "stream_vision", fake_vision)
+    monkeypatch.setattr(
+        GrowthService,
+        "_extract_image",
+        staticmethod(lambda content: "会议白板：本周完成需求评审"),
+    )
 
     text_material = client.post(
         "/api/v1/materials",
@@ -1478,10 +1631,11 @@ def test_v03_rejects_broken_excel_instead_of_guessing(
 def test_v03_report_uses_completed_tasks_and_deletes_material_derivatives(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
+    today = datetime.now(UTC).date()
     draft = client.post(
         "/api/v1/plans:draft",
         headers=auth_headers,
-        json={"goal": "完成本周汇报", "deadline": "2026-08-24"},
+        json={"goal": "完成本周汇报", "deadline": today.isoformat()},
     ).json()
     plan = client.post(
         f"/api/v1/plan-drafts/{draft['id']}:confirm",
@@ -1505,8 +1659,8 @@ def test_v03_report_uses_completed_tasks_and_deletes_material_derivatives(
         headers=auth_headers,
         json={
             "period_type": "weekly",
-            "period_start": "2026-08-01",
-            "period_end": "2026-08-31",
+            "period_start": (today - timedelta(days=1)).isoformat(),
+            "period_end": (today + timedelta(days=1)).isoformat(),
         },
     )
     assert report_response.status_code == 201
@@ -1549,6 +1703,7 @@ def test_chat_generated_docx_and_xlsx_are_downloadable_and_private(
     )
     assert response.status_code == 200
     assert "event: artifacts" in response.text
+    assert "event: artifact.quality" in response.text
 
     messages = client.get(
         f"/api/v1/conversations/{conversation['id']}/messages", headers=auth_headers
@@ -1557,6 +1712,8 @@ def test_chat_generated_docx_and_xlsx_are_downloadable_and_private(
     assert {item["artifact_type"] for item in artifacts} == {"docx", "xlsx"}
 
     by_type = {item["artifact_type"]: item for item in artifacts}
+    assert by_type["docx"]["quality"]["structural_issues"] == []
+    assert by_type["docx"]["quality"]["model_review"] == "skipped"
     docx_response = client.get(
         f"/api/v1/artifacts/{by_type['docx']['id']}/download", headers=auth_headers
     )
@@ -1574,10 +1731,7 @@ def test_chat_generated_docx_and_xlsx_are_downloadable_and_private(
     workbook = load_workbook(BytesIO(xlsx_response.content), data_only=False)
     sheet = workbook["内容"]
     values = {
-        str(cell.value)
-        for row in sheet.iter_rows()
-        for cell in row
-        if cell.value is not None
+        str(cell.value) for row in sheet.iter_rows() for cell in row if cell.value is not None
     }
     assert {"事项", "负责人", "整理进展", "小林"}.issubset(values)
     assert sheet.freeze_panes == "A3"
@@ -1608,6 +1762,9 @@ def test_chat_plain_word_request_tells_model_to_create_and_returns_download(
         system_prompt = messages[0]["content"]
         assert "具备生成并提供可下载的 Word（DOCX）文件的能力" in system_prompt
         assert "不得声称无法生成" in system_prompt
+        assert "<runtime_context>" in system_prompt
+        assert "当前日期：" in system_prompt
+        assert "时区：Asia/Shanghai (UTC+08:00)" in system_prompt
         yield "# 通用工作文档\n\n## 目标\n\n请在此填写目标。\n\n## 内容\n\n请在此补充正文。"
 
     monkeypatch.setattr(DeepSeekProvider, "stream_chat", fake_stream)
@@ -1632,9 +1789,7 @@ def test_chat_plain_word_request_tells_model_to_create_and_returns_download(
     ).json()
     artifact = messages[-1]["generated_artifacts"][0]
     assert artifact["artifact_type"] == "docx"
-    downloaded = client.get(
-        f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers
-    )
+    downloaded = client.get(f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers)
     document = Document(BytesIO(downloaded.content))
     document_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
     assert "通用工作文档" in document_text
@@ -1679,9 +1834,7 @@ def test_chat_can_reformat_latest_generated_docx_and_return_new_download(
     ).json()
     artifact = messages[-1]["generated_artifacts"][0]
     assert artifact["filename"].endswith("_黑色.docx")
-    download = client.get(
-        f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers
-    )
+    download = client.get(f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers)
     document = Document(BytesIO(download.content))
     text_runs = [
         run
@@ -1690,8 +1843,7 @@ def test_chat_can_reformat_latest_generated_docx_and_return_new_download(
     ]
     assert text_runs
     assert all(
-        run.get_or_add_rPr().find(qn("w:color")).get(qn("w:val")) == "000000"
-        for run in text_runs
+        run.get_or_add_rPr().find(qn("w:color")).get(qn("w:val")) == "000000" for run in text_runs
     )
 
 
@@ -1757,9 +1909,7 @@ def test_chat_edits_uploaded_docx_and_returns_preserved_download(
     ).json()
     artifact = messages[-1]["generated_artifacts"][0]
     assert artifact["filename"] == "实习问卷_已补全.docx"
-    download = client.get(
-        f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers
-    )
+    download = client.get(f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers)
     edited = Document(BytesIO(download.content))
     answer = edited.tables[0].cell(0, 1)
     assert answer.text == "协助整理需求、分析数据并完成周报。"
@@ -1830,9 +1980,7 @@ def test_chat_edits_uploaded_xlsx_without_overwriting_format_or_formula(
         f"/api/v1/conversations/{conversation['id']}/messages", headers=auth_headers
     ).json()
     artifact = messages[-1]["generated_artifacts"][0]
-    download = client.get(
-        f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers
-    )
+    download = client.get(f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers)
     edited = load_workbook(BytesIO(download.content), data_only=False)
     edited_sheet = edited["登记表"]
     assert edited_sheet["B1"].value == "完成需求评审和竞品分析"
@@ -1908,9 +2056,7 @@ def test_chat_asks_for_missing_facts_before_editing_attachment(
         f"/api/v1/conversations/{conversation['id']}/messages", headers=auth_headers
     ).json()
     artifact = messages[-1]["generated_artifacts"][0]
-    download = client.get(
-        f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers
-    )
+    download = client.get(f"/api/v1/artifacts/{artifact['id']}/download", headers=auth_headers)
     edited = Document(BytesIO(download.content))
     assert edited.tables[0].cell(0, 1).text == "启程科技"
 

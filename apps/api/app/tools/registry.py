@@ -66,16 +66,17 @@ class ToolRegistry:
             for item in self._tools.values()
         ]
 
-    def model_schemas(self, *, effects: set[str] | None = None) -> list[dict[str, Any]]:
+    def model_schemas(
+        self, *, effects: set[str] | None = None, excluded_names: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         return [
             item.model_tool_schema()
             for item in self._tools.values()
-            if effects is None or item.effect in effects
+            if (effects is None or item.effect in effects)
+            and item.name not in (excluded_names or set())
         ]
 
-    async def invoke(
-        self, name: str, arguments: dict[str, Any], context: ToolContext
-    ) -> BaseModel:
+    async def invoke(self, name: str, arguments: dict[str, Any], context: ToolContext) -> BaseModel:
         definition = self.get(name)
         if definition.requires_confirmation and not context.confirmation_token:
             raise AppError(
@@ -90,7 +91,7 @@ class ToolRegistry:
                 "TOOL_VALIDATION_ERROR",
                 "工具参数不符合约定",
                 status_code=422,
-                details=[{"errors": exc.errors(include_url=False)}],
+                details=[{"errors": exc.errors(include_url=False, include_context=False)}],
             ) from exc
 
         serialized = payload.model_dump(mode="json")
@@ -125,7 +126,11 @@ class ToolRegistry:
             run.status = "failed"
             run.error_code = "TOOL_TIMEOUT"
             raise AppError(
-                "TOOL_TIMEOUT", "工具执行超时", status_code=504, retryable=True
+                "TOOL_TIMEOUT",
+                "工具执行超时",
+                status_code=504,
+                retryable=True,
+                details=[{"timeout_seconds": definition.timeout_seconds}],
             ) from exc
         except AppError as exc:
             run.status = "failed"

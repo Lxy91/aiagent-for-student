@@ -4,6 +4,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.modules.chat.execution_plan import ExecutionPlan
+from app.modules.chat.interrupts import ExecutionInterrupt
+
 
 class CreateConversationRequest(BaseModel):
     title: str = Field(default="新对话", min_length=1, max_length=100)
@@ -34,6 +37,9 @@ class UpdateConversationRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
+    resume_checkpoint_id: UUID | None = None
+    resume_action: Literal["continue", "cancel"] = "continue"
+    use_plan: bool = False
     content: str = Field(default="", max_length=10_000)
     attachment_ids: list[UUID] = Field(default_factory=list, max_length=5)
 
@@ -68,6 +74,7 @@ class GeneratedArtifactResponse(BaseModel):
     artifact_type: Literal["docx", "xlsx"]
     mime_type: str
     size_bytes: int
+    quality: dict | None = None
 
 
 class CitationResponse(BaseModel):
@@ -96,6 +103,10 @@ class TokenUsageResponse(BaseModel):
 
 
 class MessageResponse(BaseModel):
+    delivery_status: Literal["draft", "waiting_user", "final", "cancelled"] = "final"
+    draft_content: str | None = None
+    execution_interrupt: ExecutionInterrupt | None = None
+    execution_plan: ExecutionPlan | None = None
     id: UUID
     conversation_id: UUID
     role: Literal["user", "assistant"]

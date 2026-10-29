@@ -8,9 +8,7 @@ class WebSearchHandler:
         self.provider = provider
         self.max_results = max_results
 
-    async def __call__(
-        self, payload: WebSearchInput, context: ToolContext
-    ) -> WebSearchOutput:
+    async def __call__(self, payload: WebSearchInput, context: ToolContext) -> WebSearchOutput:
         del context
         response = await self.provider.search(
             payload.query, max_results=min(payload.max_results, self.max_results)

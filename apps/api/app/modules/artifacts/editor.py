@@ -59,15 +59,11 @@ def editable_attachments(content: str, attachments: list[dict[str, str]]) -> lis
     if not any(marker in normalized for marker in (*EDIT_INTENT_MARKERS, *FORMAT_INTENT_MARKERS)):
         return []
     return [
-        item
-        for item in attachments
-        if Path(item["title"]).suffix.lower() in EDITABLE_EXTENSIONS
+        item for item in attachments if Path(item["title"]).suffix.lower() in EDITABLE_EXTENSIONS
     ]
 
 
-def select_edit_target(
-    content: str, candidates: list[dict[str, str]]
-) -> dict[str, str] | None:
+def select_edit_target(content: str, candidates: list[dict[str, str]]) -> dict[str, str] | None:
     """Select an explicitly numbered target while keeping other files as references."""
     if len(candidates) == 1:
         return candidates[0]
@@ -139,11 +135,7 @@ def normalize_edit_plan(payload: dict[str, Any]) -> tuple[str, list[str], list[d
     raw_missing = payload.get("missing_information", [])
     if not isinstance(raw_missing, list):
         raw_missing = []
-    missing = [
-        str(item).strip()
-        for item in raw_missing
-        if str(item).strip()
-    ][:20]
+    missing = [str(item).strip() for item in raw_missing if str(item).strip()][:20]
     changes: list[dict[str, str]] = []
     raw_changes = payload.get("changes", [])
     if not isinstance(raw_changes, list):

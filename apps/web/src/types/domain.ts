@@ -18,7 +18,41 @@ export interface ReasoningStep {
   elapsedMs?: number;
 }
 
+export interface ExecutionPlan {
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: 'pending' | 'running' | 'completed' | 'blocked';
+    result: string;
+  }>;
+  explanation: string;
+  status: 'running' | 'completed' | 'paused' | 'waiting_user' | 'cancelled';
+  acceptance_status?: 'pending' | 'passed' | 'needs_input' | 'failed';
+  acceptance_issues?: string[];
+}
+
+export interface ExecutionInterrupt {
+  requires_input?: boolean;
+  id: string;
+  kind: 'question' | 'error' | 'acceptance';
+  status: 'waiting' | 'resolved' | 'cancelled';
+  question: string;
+  reason: string;
+  options: string[];
+  recommendation?: string;
+  problems?: string[];
+}
+
+export interface CheckpointResume {
+  checkpointId: string;
+  action: 'continue' | 'cancel';
+}
+
 export interface ChatMessage {
+  deliveryStatus?: 'draft' | 'waiting_user' | 'final' | 'cancelled';
+  draftContent?: string;
+  executionPlan?: ExecutionPlan;
+  executionInterrupt?: ExecutionInterrupt;
   id: string;
   role: MessageRole;
   content: string;
@@ -186,4 +220,59 @@ export interface LearningRecommendation {
 export interface GrowthProfile {
   evidence: GrowthEvidence[];
   recommendations: LearningRecommendation[];
+}
+
+export type InterviewTrack = 'react' | 'vue' | 'general';
+export type InterviewType = 'technical' | 'hr' | 'mixed';
+export type InterviewDifficulty = 'standard' | 'advanced' | 'pressure';
+
+export interface InterviewSession {
+  id: string;
+  appId: string;
+  roomId: string;
+  userId: string;
+  agentUserId: string;
+  taskId: string;
+  token: string;
+  avatarWssToken?: string;
+  avatarImageUrl?: string;
+  avatarSpeaker: string;
+  track: InterviewTrack;
+  interviewType: InterviewType;
+  difficulty: InterviewDifficulty;
+  durationMinutes: number;
+  enableAvatar: boolean;
+  interviewPrompt: string;
+  status: 'ready' | 'active' | 'stopped';
+}
+
+export interface InterviewTranscriptEntry {
+  text: string;
+  recordedAtSeconds: number;
+}
+
+export interface InterviewScoreItem {
+  key: 'fundamentals' | 'framework' | 'engineering' | 'communication' | 'problem_solving';
+  label: string;
+  score: number;
+  comment: string;
+}
+
+export interface InterviewQaReview {
+  question: string;
+  answer: string;
+  score: number;
+  feedback: string;
+}
+
+export interface InterviewReport {
+  sessionId: string;
+  overallScore: number;
+  summary: string;
+  scoreItems: InterviewScoreItem[];
+  qaReviews: InterviewQaReview[];
+  strengths: string[];
+  improvements: string[];
+  nextSteps: string[];
+  createdAt: string;
 }

@@ -1,0 +1,9 @@
+name: recruitment.search
+version: 1.0.0
+effect: read
+timeout_seconds: 5
+max_retries: 0
+idempotency: not_required
+confirmation_required: false
+input_schema: RecruitmentSearchInput
+output_schema: RecruitmentSearchOutput

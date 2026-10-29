@@ -83,6 +83,7 @@ export function MaterialsPage() {
 
   const uploadProps: UploadProps = {
     multiple: false,
+    pastable: true,
     showUploadList: false,
     accept: '.mp3,.wav,.m4a,.png,.jpg,.jpeg,.pdf,.docx,.xlsx,.xls,.csv,.md,.txt',
     beforeUpload: (file) => {
@@ -96,7 +97,7 @@ export function MaterialsPage() {
       <PageHeader
         eyebrow="V0.3 · 工作资料"
         title="资料收件箱"
-        description="集中接收会议录音、截图和文档。所有草稿都保留来源；未配置识别能力时不会猜测材料内容。"
+        description="集中接收会议录音、截图和文档。截图会先在本地识别文字并检查隐私，再形成可追溯草稿。"
       />
       <div className="material-privacy-banner">
         <LockOutlined />
@@ -109,7 +110,7 @@ export function MaterialsPage() {
         <p className="ant-upload-drag-icon">
           <CloudUploadOutlined />
         </p>
-        <p className="ant-upload-text">拖入会议录音、截图或文档</p>
+        <p className="ant-upload-text">拖入或粘贴会议截图，也可上传录音和文档</p>
         <p className="ant-upload-hint">
           支持 MP3/WAV/M4A、PNG/JPG、PDF/DOCX、Excel/CSV、MD/TXT，单个不超过 20 MB
         </p>

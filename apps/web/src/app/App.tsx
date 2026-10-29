@@ -3,6 +3,7 @@ import {
   BulbOutlined,
   CalendarOutlined,
   FileSearchOutlined,
+  AudioOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   MessageOutlined,
@@ -17,6 +18,7 @@ import { Navigate, Outlet, Route, Routes, useLocation, useNavigate } from 'react
 import { BrandMark } from '../components/BrandMark';
 import { StateCard } from '../components/StateCard';
 import { useAuth } from '../features/auth/AuthProvider';
+import { PluginMarket } from '../features/plugins/PluginMarket';
 
 const ChatPage = lazy(() =>
   import('../features/chat/pages/ChatPage').then((module) => ({ default: module.ChatPage })),
@@ -45,11 +47,17 @@ const GrowthPage = lazy(() =>
 const SettingsPage = lazy(() =>
   import('../pages/SettingsPage').then((module) => ({ default: module.SettingsPage })),
 );
+const InterviewPage = lazy(() =>
+  import('../features/interview/pages/InterviewPage').then((module) => ({
+    default: module.InterviewPage,
+  })),
+);
 
 const { Header, Sider, Content } = Layout;
 
 const navigationItems = [
   { key: '/chat', icon: <MessageOutlined />, label: '智能对话' },
+  { key: '/interview', icon: <AudioOutlined />, label: 'AI 模拟面试' },
   { key: '/plans', icon: <CalendarOutlined />, label: '行动计划' },
   { key: '/memory', icon: <BulbOutlined />, label: '记忆中心' },
   { key: '/knowledge', icon: <BookOutlined />, label: '知识库' },
@@ -134,6 +142,7 @@ function AppShell() {
             <span className="trace-label">V0.3 · Growth Loop</span>
           </div>
           <Space size={8}>
+            <PluginMarket />
             <Tooltip title="深色模式将在后续版本开放">
               <Button type="text" icon={<MoonOutlined />} aria-label="深色模式" />
             </Tooltip>
@@ -170,6 +179,7 @@ export function App() {
       <Route element={<AppShell />}>
         <Route index element={<Navigate to="/chat" replace />} />
         <Route path="chat" element={<ChatPage />} />
+        <Route path="interview" element={<InterviewPage />} />
         <Route path="plans" element={<PlansPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="knowledge" element={<KnowledgePage />} />

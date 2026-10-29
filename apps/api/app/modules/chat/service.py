@@ -20,6 +20,8 @@ from app.modules.chat.context import (
     sanitize_message_content,
     wrap_untrusted_content,
 )
+from app.modules.chat.execution_plan import ExecutionPlan
+from app.modules.chat.interrupts import present_question
 from app.modules.chat.schemas import (
     ConversationResponse,
     CreateConversationRequest,
@@ -43,8 +45,10 @@ def estimate_text_tokens(content: str) -> int:
 
 def estimate_message_tokens(message: dict[str, str]) -> int:
     """Include a small allowance for role and message framing tokens."""
-    return 4 + estimate_text_tokens(message.get("role", "")) + estimate_text_tokens(
-        message.get("content", "")
+    return (
+        4
+        + estimate_text_tokens(message.get("role", ""))
+        + estimate_text_tokens(message.get("content", ""))
     )
 
 
@@ -95,6 +99,37 @@ class ExecutionNarrative(BaseModel):
     next_action: str = Field(min_length=1, max_length=240)
 
 
+def delivery_view(item: MessageModel) -> dict:
+    metadata = item.metadata_json or {}
+    plan = metadata.get("execution_plan") or {}
+    interrupt = metadata.get("execution_interrupt") or {}
+    status = metadata.get("delivery_status", "final")
+    if plan and plan.get("acceptance_status") != "passed" and status != "cancelled":
+        status = "waiting_user" if interrupt.get("status") == "waiting" else "draft"
+    if status not in {"draft", "waiting_user"}:
+        return {
+            "delivery_status": status,
+            "content": sanitize_assistant_content(item.content)
+            if item.role == "assistant"
+            else item.content,
+        }
+    draft = metadata.get("draft_content") or item.content
+    if draft.startswith(("任务执行进度已保存", "任务进度已保存", "方案尚未定稿", "任务已暂停")):
+        draft = None
+    if not plan and draft:
+        return {
+            "delivery_status": status,
+            "content": sanitize_assistant_content(item.content),
+            "draft_content": draft,
+        }
+    summary = (
+        "方案尚未定稿。确认下面的问题后，我会继续处理。"
+        if interrupt.get("status") == "waiting"
+        else "本轮草稿已保存，最终方案请以后续通过检查的结果为准。"
+    )
+    return {"delivery_status": status, "content": summary, "draft_content": draft}
+
+
 @dataclass
 class ContextWindow:
     messages: list[dict[str, str]]
@@ -134,7 +169,8 @@ async def build_execution_narrative(
                         '只输出 JSON：{"understanding":"...","next_action":"..."}。'
                         "understanding 用一句自然中文具体概括当前问题重点；next_action 用第一人称"
                         "具体说明已经决定的下一步。两项都不超过 80 个汉字。只有已确定动作包含"
-                        " web.search 时，才能提到联网、最新、时效性或来源核对；没有选择工具时，"
+                        " web.search 或 web.fetch 时，才能提到联网、最新、时效性或来源核对；"
+                        "没有选择工具时，"
                         "不要解释为什么不使用工具。结合已获得的观察结果描述后续动作，不得虚构"
                         "未执行的操作，避免使用‘目标、时效性要求和可用工具’等通用模板。"
                     ),
@@ -153,7 +189,7 @@ async def build_execution_narrative(
             "最新信息",
             "核对来源",
         )
-        if "web.search" not in selected_tools and any(
+        if not {"web.search", "web.fetch"}.intersection(selected_tools) and any(
             marker in narrative.next_action for marker in forbidden_web_markers
         ):
             raise ValueError("Narrative mentions web work that was not selected")
@@ -336,7 +372,14 @@ class ConversationService:
                     "status": item.status,
                 }
             )
-            if item.material_type == "image" and item.binary_content:
+            image_can_use_vision = bool(
+                item.material_type == "image"
+                and item.binary_content
+                and item.status == "ready"
+                and item.privacy_status == "clear"
+                and item.extracted_text
+            )
+            if image_can_use_vision:
                 vision_images.append(
                     {
                         "id": item.id,
@@ -345,7 +388,7 @@ class ConversationService:
                         "base64": base64.b64encode(item.binary_content).decode("ascii"),
                     }
                 )
-            if item.material_type == "image" and item.binary_content:
+            if image_can_use_vision:
                 context_sections.append(
                     wrap_untrusted_content(
                         "attachment",
@@ -358,9 +401,7 @@ class ConversationService:
                 bounded_text, was_truncated = truncate_text_to_token_budget(
                     source_text, max(64, remaining_tokens)
                 )
-                remaining_tokens = max(
-                    0, remaining_tokens - estimate_text_tokens(bounded_text)
-                )
+                remaining_tokens = max(0, remaining_tokens - estimate_text_tokens(bounded_text))
                 context_sections.append(
                     wrap_untrusted_content(
                         "attachment",
@@ -603,6 +644,55 @@ class ConversationService:
                     }
         return None
 
+    async def claim_execution_checkpoint(
+        self,
+        conversation_id: UUID,
+        checkpoint_id: UUID,
+        answer: str,
+        action: str,
+    ) -> dict:
+        # The caller has already verified ownership; lock the message to reject duplicate resumes.
+        result = await self.session.execute(
+            select(MessageModel)
+            .where(
+                MessageModel.id == str(checkpoint_id),
+                MessageModel.conversation_id == str(conversation_id),
+            )
+            .with_for_update()
+        )
+        item = result.scalar_one_or_none()
+        metadata = dict(item.metadata_json or {}) if item else {}
+        interrupt = metadata.get("execution_interrupt") or {}
+        state = metadata.get("execution_checkpoint")
+        if not state or interrupt.get("status") != "waiting":
+            raise AppError(
+                "CHECKPOINT_NOT_AVAILABLE",
+                "该检查点不存在、已恢复或已结束，请刷新任务进度",
+                status_code=409,
+            )
+        state = dict(state)
+        stored_issues = (metadata.get("execution_plan") or {}).get("acceptance_issues", [])
+        if not state.get("draft_content"):
+            state["draft_content"] = metadata.get("draft_content") or next(
+                (
+                    message.get("content", "")
+                    for message in reversed(state.get("messages", []))
+                    if message.get("role") == "assistant"
+                    and len(str(message.get("content") or "")) > 200
+                ),
+                "",
+            )
+        if any("截断" in issue for issue in stored_issues) and state.get("draft_content"):
+            state["draft_truncated"] = True
+        metadata["execution_interrupt"] = {
+            **interrupt,
+            "status": "cancelled" if action == "cancel" else "resolved",
+        }
+        metadata["checkpoint_answer"] = answer
+        item.metadata_json = metadata
+        await self.session.commit()
+        return state
+
     async def list_messages(self, user_id: UUID, conversation_id: UUID) -> list[MessageResponse]:
         await self.get_owned(user_id, conversation_id)
         result = await self.session.scalars(
@@ -615,12 +705,23 @@ class ConversationService:
                 id=item.id,
                 conversation_id=item.conversation_id,
                 role=item.role,
-                content=(
-                    item.sanitized_content if item.role == "assistant" else item.content
-                ),
+                **delivery_view(item),
                 created_at=item.created_at,
                 citations=(item.metadata_json or {}).get("citations", []),
                 reasoning_steps=(item.metadata_json or {}).get("reasoning_steps", []),
+                execution_plan=ExecutionPlan.model_validate(
+                    item.metadata_json["execution_plan"]
+                ).snapshot(paused=True)
+                if (item.metadata_json or {}).get("execution_plan")
+                else None,
+                execution_interrupt=present_question(
+                    item.metadata_json["execution_interrupt"],
+                    ((item.metadata_json or {}).get("execution_plan") or {}).get(
+                        "acceptance_issues", []
+                    ),
+                )
+                if (item.metadata_json or {}).get("execution_interrupt")
+                else None,
                 attachments=(item.metadata_json or {}).get("attachments", []),
                 generated_images=(item.metadata_json or {}).get("generated_images", []),
                 generated_artifacts=(item.metadata_json or {}).get("generated_artifacts", []),

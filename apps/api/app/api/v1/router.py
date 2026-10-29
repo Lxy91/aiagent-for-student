@@ -4,9 +4,11 @@ from app.modules.artifacts.api import router as artifacts_router
 from app.modules.chat.api import router as chat_router
 from app.modules.growth.api import router as growth_router
 from app.modules.identity.api import router as identity_router
+from app.modules.interview.api import router as interview_router
 from app.modules.knowledge.api import router as knowledge_router
 from app.modules.memory.api import router as memory_router
 from app.modules.planner.api import router as planner_router
+from app.modules.recruitment.api import router as recruitment_router
 from app.modules.tools.api import router as tools_router
 
 router = APIRouter(prefix="/api/v1")
@@ -18,3 +20,5 @@ router.include_router(knowledge_router)
 router.include_router(planner_router)
 router.include_router(tools_router)
 router.include_router(growth_router)
+router.include_router(recruitment_router)
+router.include_router(interview_router)

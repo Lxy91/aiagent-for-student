@@ -18,6 +18,7 @@ import {
   PushpinFilled,
   PushpinOutlined,
   EditOutlined,
+  UnorderedListOutlined,
   InboxOutlined,
   SendOutlined,
   StopOutlined,
@@ -53,6 +54,9 @@ import type {
   ChatMessage,
   Conversation,
   ConversationContext,
+  ExecutionPlan,
+  ExecutionInterrupt,
+  CheckpointResume,
   GeneratedArtifact,
   MaterialType,
   ReasoningStep,
@@ -73,6 +77,7 @@ const attachmentIcons: Record<MaterialType, ReactNode> = {
 interface ConversationGeneration {
   assistantId: string;
   toolStatus?: string;
+  phaseLabel?: string;
 }
 
 const markdownComponents: Components = {
@@ -98,7 +103,152 @@ function AssistantMarkdown({ content }: { content: string }) {
   );
 }
 
+function problemSummaries(issues: string[]): string[] {
+  const result: string[] = [];
+  for (const issue of issues) {
+    const text = issue.replace(/\s+/g, ' ');
+    const summary =
+      text.includes('截断') && text.includes('关键路径') && text.includes('状态快照')
+        ? '方案正文被截断，关键路径和状态快照尚未输出。'
+        : text.includes('截断')
+          ? '部分正文被截断，方案尚未输出完整。'
+          : text.split(/[。；;\n]/)[0].slice(0, 100);
+    if (/(.{6,60})\1{2}/.test(summary)) continue;
+    if (
+      summary &&
+      !result.includes(summary) &&
+      !(summary.includes('截断') && result.some((item) => item.includes('截断')))
+    )
+      result.push(summary);
+    if (result.length === 2) break;
+  }
+  return result;
+}
+
+function isDraftResponse(item: ChatMessage): boolean {
+  if (item.deliveryStatus) return ['draft', 'waiting_user'].includes(item.deliveryStatus);
+  return Boolean(item.executionPlan && item.executionPlan.acceptance_status !== 'passed');
+}
+
+function AssistantResponse({
+  item,
+  active,
+  phase,
+}: {
+  item: ChatMessage;
+  active: boolean;
+  phase?: string;
+}) {
+  if (isDraftResponse(item)) {
+    const draft = item.draftContent ?? (item.deliveryStatus ? undefined : item.content);
+    return (
+      <>
+        <p className="answer-phase" role="status">
+          {active
+            ? (phase ?? '正在处理任务，检查后展示正文。')
+            : item.executionPlan?.acceptance_status === 'failed'
+              ? (item.executionPlan.explanation ?? '本次未通过检查，草稿和进度已保存。')
+              : '方案尚未定稿，已保存草稿和进度。'}
+        </p>
+        {draft ? (
+          <Collapse
+            className="draft-preview"
+            size="small"
+            items={[
+              {
+                key: 'draft',
+                label: '查看未定稿草稿（仅供参考）',
+                children: (
+                  <div className="draft-preview-body">
+                    <AssistantMarkdown content={draft} />
+                  </div>
+                ),
+              },
+            ]}
+          />
+        ) : null}
+      </>
+    );
+  }
+  if (item.content) return <AssistantMarkdown content={item.content} />;
+  return (
+    <p className="answer-phase" role="status">
+      {active ? (phase ?? '正在执行任务…') : '任务进度已保存。'}
+    </p>
+  );
+}
+
+function interruptCopy(question: ExecutionInterrupt, issues: string[] = []): ExecutionInterrupt {
+  const problems = problemSummaries(question.problems?.length ? question.problems : issues);
+  if (question.kind === 'acceptance' && problems.some((item) => item.includes('截断'))) {
+    return {
+      ...question,
+      problems,
+      question: '要从断点继续补完方案吗？',
+      reason: '草稿已经保存，但还没有写完整。',
+      recommendation: '建议接着补完缺失章节，保留已经完成的内容。',
+      options: ['继续补完方案（推荐）', '我来调整输出范围'],
+    };
+  }
+  if (
+    question.kind === 'acceptance' &&
+    (question.reason.length > 220 || question.question.length > 160)
+  ) {
+    return {
+      ...question,
+      problems,
+      question: '要先保留原来的要求，由我继续调整方案吗？',
+      reason: '方案还有需要修正的地方，计算和排期问题由我处理。',
+      recommendation: '建议先保留你的原要求，我会自动修订后重新检查。',
+      options: ['保持原要求，继续自动调整（推荐）', '我来补充优先级'],
+    };
+  }
+  return {
+    ...question,
+    problems,
+    question: question.question.slice(0, 160),
+    reason:
+      question.reason.length > 220 ? '当前进度已保存，确认这一项安排后即可继续。' : question.reason,
+    recommendation: question.recommendation?.slice(0, 160),
+    options: question.options.slice(0, 3).map((option) => option.slice(0, 80)),
+  };
+}
+
 function ExecutionTrace({ steps }: { steps: ReasoningStep[] }) {
+  const displaySteps = useMemo(() => {
+    const items: ReasoningStep[] = [];
+    let legacy: ReasoningStep | undefined;
+    let count = 0;
+    const flush = () => {
+      if (legacy)
+        items.push({
+          ...legacy,
+          kind: 'tool',
+          detail: `execution.update_plan：计划更新（${count > 1 ? `合并 ${count} 条历史记录` : '历史记录'}）。`,
+        });
+      legacy = undefined;
+      count = 0;
+    };
+    for (const step of steps) {
+      if (step.detail === '我会更新任务计划，再推进当前步骤。') {
+        legacy = step;
+        count += 1;
+      } else {
+        flush();
+        items.push(
+          step.detail === '先将任务拆成可逐步完成的执行计划。'
+            ? {
+                ...step,
+                kind: 'tool',
+                detail: 'execution.update_plan：准备创建任务清单（历史记录）。',
+              }
+            : step,
+        );
+      }
+    }
+    flush();
+    return items;
+  }, [steps]);
   const latestElapsed = Math.max(0, ...steps.map((step) => step.elapsedMs ?? 0));
   const isRunning = steps.some((step) => step.status === 'running');
   const [elapsed, setElapsed] = useState(latestElapsed);
@@ -134,7 +284,7 @@ function ExecutionTrace({ steps }: { steps: ReasoningStep[] }) {
           ),
           children: (
             <div className="reasoning-log">
-              {steps.map((step) =>
+              {displaySteps.map((step) =>
                 step.kind === 'tool' ? (
                   <div key={step.id} className={`reasoning-tool-row ${step.status}`} role="status">
                     {step.status === 'running' ? (
@@ -148,10 +298,101 @@ function ExecutionTrace({ steps }: { steps: ReasoningStep[] }) {
                   </div>
                 ) : (
                   <p key={step.id} className={`reasoning-narrative ${step.status}`}>
-                    {step.detail}
+                    {step.id === 'task-acceptance' && step.detail.length > 180
+                      ? '方案还需要调整，具体问题由助手继续处理。'
+                      : step.detail}
                   </p>
                 ),
               )}
+            </div>
+          ),
+        },
+      ]}
+    />
+  );
+}
+
+function TaskPlan({
+  plan,
+  active,
+  onContinue,
+  disabled,
+}: {
+  plan: ExecutionPlan;
+  active: boolean;
+  onContinue: () => void;
+  disabled: boolean;
+}) {
+  const completed = plan.tasks.filter((task) => task.status === 'completed').length;
+  const statusLabel =
+    plan.status === 'cancelled'
+      ? '已结束'
+      : plan.status === 'waiting_user'
+        ? '等待你的答复'
+        : plan.status === 'completed'
+          ? '验收通过'
+          : completed === plan.tasks.length && active
+            ? '待验收'
+            : active
+              ? '执行中'
+              : '待继续';
+  const labels = {
+    pending: '待处理',
+    running: active ? '进行中' : '待继续',
+    completed: '已完成',
+    blocked: '受阻',
+  };
+  return (
+    <Collapse
+      className="execution-plan"
+      size="small"
+      defaultActiveKey={['plan']}
+      items={[
+        {
+          key: 'plan',
+          label: (
+            <Space>
+              <UnorderedListOutlined />
+              <strong>任务计划</strong>
+              <span>
+                {completed}/{plan.tasks.length} 步骤完成
+              </span>
+              <Tag
+                color={plan.status === 'completed' ? 'success' : active ? 'processing' : 'warning'}
+              >
+                {statusLabel}
+              </Tag>
+            </Space>
+          ),
+          children: (
+            <div className="execution-plan-body" aria-live="polite">
+              {plan.explanation ? <p>{plan.explanation}</p> : null}
+              <ol>
+                {plan.tasks.map((task) => (
+                  <li key={task.id} className={task.status}>
+                    <div>
+                      <span>
+                        {task.status === 'completed' ? (
+                          <CheckCircleFilled />
+                        ) : task.status === 'running' && active ? (
+                          <LoadingOutlined spin />
+                        ) : null}
+                      </span>
+                      <strong>{task.title}</strong>
+                      <Tag>{labels[task.status]}</Tag>
+                    </div>
+                    {task.result ? <p>{task.result}</p> : null}
+                  </li>
+                ))}
+              </ol>
+              {plan.acceptance_issues?.length ? (
+                <p role="status">方案还需要调整，具体计算和排期问题由助手处理。</p>
+              ) : null}
+              {!active && plan.status !== 'completed' && plan.status !== 'cancelled' ? (
+                <Button size="small" onClick={onContinue} disabled={disabled}>
+                  继续执行剩余步骤
+                </Button>
+              ) : null}
             </div>
           ),
         },
@@ -165,6 +406,11 @@ export function ChatPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState('');
+  const [interruptDialog, setInterruptDialog] = useState<ExecutionInterrupt>();
+  const [interruptAnswer, setInterruptAnswer] = useState('');
+  const [interruptOption, setInterruptOption] = useState('');
+  const [dismissedInterrupts, setDismissedInterrupts] = useState<Record<string, boolean>>({});
+  const [usePlan, setUsePlan] = useState(false);
   const [attachments, setAttachments] = useState<WorkMaterial[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [conversationId, setConversationId] = useState<string>();
@@ -172,6 +418,7 @@ export function ChatPage() {
   const [renameDraft, setRenameDraft] = useState('');
   const [generations, setGenerations] = useState<Record<string, ConversationGeneration>>({});
   const generationControllersRef = useRef(new Map<string, AbortController>());
+  const resumedInternalRepairsRef = useRef(new Set<string>());
   const conversations = useQuery({
     queryKey: ['conversations'],
     queryFn: apiClient.getConversations,
@@ -254,6 +501,44 @@ export function ChatPage() {
   const currentGeneration = conversationId ? generations[conversationId] : undefined;
   const isGenerating = Boolean(currentGeneration);
   const toolStatus = currentGeneration?.toolStatus;
+  const planMessage = [...localMessages].reverse().find((item) => item.executionPlan);
+  const pendingQuestion = [...localMessages]
+    .reverse()
+    .find((item) => item.executionInterrupt?.status === 'waiting')?.executionInterrupt;
+
+  const showInterrupt = (question: ExecutionInterrupt) => {
+    setInterruptAnswer('');
+    setInterruptOption('');
+    setInterruptDialog(
+      interruptCopy(
+        question,
+        localMessages.find((item) => item.executionInterrupt?.id === question.id)?.executionPlan
+          ?.acceptance_issues,
+      ),
+    );
+  };
+  const dialogCopy = interruptDialog
+    ? interruptCopy(
+        interruptDialog,
+        localMessages.find((item) => item.executionInterrupt?.id === interruptDialog.id)
+          ?.executionPlan?.acceptance_issues,
+      )
+    : undefined;
+
+  useEffect(() => {
+    if (
+      !isGenerating &&
+      pendingQuestion &&
+      pendingQuestion.requires_input !== false &&
+      !dismissedInterrupts[pendingQuestion.id] &&
+      interruptDialog?.id !== pendingQuestion.id
+    )
+      showInterrupt(pendingQuestion);
+  }, [pendingQuestion, isGenerating, dismissedInterrupts, interruptDialog?.id]);
+
+  useEffect(() => {
+    setInterruptDialog(undefined);
+  }, [conversationId]);
 
   const ensureConversation = async () => {
     if (conversationId) return conversationId;
@@ -309,9 +594,19 @@ export function ChatPage() {
     }
   };
 
-  const sendMessage = async (content = draft) => {
+  const sendMessage = async (
+    content = draft,
+    planRequested = usePlan,
+    resume?: CheckpointResume,
+    automatic = false,
+  ) => {
+    const effectiveResume =
+      resume ??
+      (pendingQuestion && !pendingQuestion.id.startsWith('local-')
+        ? { checkpointId: pendingQuestion.id, action: 'continue' as const }
+        : undefined);
     const trimmedContent = content.trim();
-    const queuedAttachments = attachments;
+    const queuedAttachments = automatic ? [] : attachments;
     if (!trimmedContent && !queuedAttachments.length) return;
     const targetId = await ensureConversation();
     if (generationControllersRef.current.has(targetId)) return;
@@ -335,12 +630,15 @@ export function ChatPage() {
       },
       { id: assistantId, role: 'assistant', content: '', createdAt: now },
     ]);
-    setDraft('');
-    setAttachments([]);
+    if (!automatic) {
+      setDraft('');
+      setAttachments([]);
+    }
     const controller = new AbortController();
     generationControllersRef.current.set(targetId, controller);
     setGenerations((items) => ({ ...items, [targetId]: { assistantId } }));
     let streamedText = '';
+    let interrupted = false;
     try {
       await apiClient.streamMessage(
         targetId,
@@ -350,12 +648,54 @@ export function ChatPage() {
           onStarted: () => {
             void queryClient.invalidateQueries({ queryKey: ['conversations'] });
           },
+          onPlan: (executionPlan) =>
+            updateCachedMessages(targetId, (items) =>
+              items.map((item) => (item.id === assistantId ? { ...item, executionPlan } : item)),
+            ),
+          onInterrupt: (executionInterrupt) => {
+            interrupted = true;
+            updateCachedMessages(targetId, (items) =>
+              items.map((item) =>
+                item.id === assistantId
+                  ? {
+                      ...item,
+                      executionInterrupt,
+                      deliveryStatus: 'waiting_user',
+                      draftContent: item.content || item.draftContent,
+                    }
+                  : item,
+              ),
+            );
+          },
           onDelta: (text) => {
             streamedText += text;
             updateCachedMessages(targetId, (items) =>
               items.map((item) =>
                 item.id === assistantId ? { ...item, content: item.content + text } : item,
               ),
+            );
+          },
+          onPhase: (phase, detail) => {
+            setGenerations((items) =>
+              items[targetId]?.assistantId === assistantId
+                ? {
+                    ...items,
+                    [targetId]: { ...items[targetId], phaseLabel: detail, toolStatus: undefined },
+                  }
+                : items,
+            );
+            updateCachedMessages(targetId, (items) =>
+              items.map((item) =>
+                item.id === assistantId
+                  ? { ...item, deliveryStatus: phase === 'delivering' ? 'final' : 'draft' }
+                  : item,
+              ),
+            );
+          },
+          onReplace: (text) => {
+            streamedText = text;
+            updateCachedMessages(targetId, (items) =>
+              items.map((item) => (item.id === assistantId ? { ...item, content: text } : item)),
             );
           },
           onToolStarted: (tool) =>
@@ -370,6 +710,8 @@ export function ChatPage() {
               assistantId,
               tool === 'web.search' ? `已检索并筛选 ${resultCount} 个来源` : '工具调用已完成',
             ),
+          onToolFailed: (tool, reason) =>
+            updateGenerationStatus(targetId, assistantId, `${tool} 失败：${reason}`),
           onCitations: (citations) =>
             updateCachedMessages(targetId, (items) =>
               items.map((item) => (item.id === assistantId ? { ...item, citations } : item)),
@@ -402,11 +744,27 @@ export function ChatPage() {
             ),
         },
         controller.signal,
+        planRequested || Boolean(effectiveResume),
+        effectiveResume,
       );
       await queryClient.invalidateQueries({ queryKey: ['messages', targetId] });
       await queryClient.invalidateQueries({ queryKey: ['conversation-context', targetId] });
     } catch (error) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && !interrupted) {
+        const connectionQuestion: ExecutionInterrupt = {
+          id: `local-${assistantId}`,
+          kind: 'error',
+          status: 'waiting',
+          question: '连接中断，要根据已保存的会话重试，还是补充要求后继续？',
+          reason: `${error instanceof Error ? error.message : '连接中断'}。未收到服务端待答复检查点，重试将参考已保存的会话记录。`,
+          options: ['根据已保存记录继续', '补充要求后继续'],
+        };
+        updateCachedMessages(targetId, (items) =>
+          items.map((item) =>
+            item.id === assistantId ? { ...item, executionInterrupt: connectionQuestion } : item,
+          ),
+        );
+        showInterrupt(connectionQuestion);
         if (streamedText) {
           message.warning('连接中断，已保留已经生成的内容');
           updateCachedMessages(targetId, (items) =>
@@ -421,10 +779,15 @@ export function ChatPage() {
           );
         } else {
           message.error(error instanceof Error ? error.message : '消息发送失败');
-          updateCachedMessages(targetId, (items) => items.filter((item) => item.id !== assistantId));
+          updateCachedMessages(targetId, (items) =>
+            items.filter(
+              (item) => item.id !== assistantId || item.executionPlan || item.executionInterrupt,
+            ),
+          );
         }
       }
     } finally {
+      void queryClient.invalidateQueries({ queryKey: ['messages', targetId] });
       if (generationControllersRef.current.get(targetId) === controller) {
         generationControllersRef.current.delete(targetId);
         setGenerations((items) => {
@@ -435,6 +798,43 @@ export function ChatPage() {
         });
       }
     }
+  };
+
+  useEffect(() => {
+    if (
+      isGenerating ||
+      !pendingQuestion ||
+      pendingQuestion.requires_input !== false ||
+      resumedInternalRepairsRef.current.has(pendingQuestion.id)
+    )
+      return;
+    resumedInternalRepairsRef.current.add(pendingQuestion.id);
+    setInterruptDialog(undefined);
+    void sendMessage(
+      '保持原始要求，自行修正计算、排期和遗漏并重新验收，无需询问是否继续。',
+      true,
+      { checkpointId: pendingQuestion.id, action: 'continue' },
+      true,
+    );
+  }, [pendingQuestion, isGenerating]);
+
+  const dismissQuestion = () => {
+    if (interruptDialog)
+      setDismissedInterrupts((items) => ({ ...items, [interruptDialog.id]: true }));
+    setInterruptDialog(undefined);
+  };
+
+  const submitQuestion = (action: 'continue' | 'cancel') => {
+    if (!interruptDialog || isGenerating) return;
+    const answer = [interruptOption, interruptAnswer.trim()].filter(Boolean).join('\n');
+    if (action === 'continue' && !answer) return;
+    const checkpointId = interruptDialog.id;
+    dismissQuestion();
+    if (checkpointId.startsWith('local-')) {
+      if (action !== 'cancel') void sendMessage(`继续此前未完成的任务。用户答复：${answer}`, true);
+      return;
+    }
+    void sendMessage(action === 'cancel' ? '结束本次任务' : answer, true, { checkpointId, action });
   };
 
   const stopGenerating = () => {
@@ -564,7 +964,13 @@ export function ChatPage() {
                 cancelText="取消"
                 onConfirm={() => compressContext.mutate(conversationId)}
               >
-                <Tooltip title="点击压缩上下文">
+                <Tooltip
+                  title={
+                    isGenerating
+                      ? '显示本轮执行上下文，包含工具定义与结果，接近预算会自动整理。手动压缩影响后续请求。'
+                      : '显示历史对话占用，点击可手动压缩历史上下文'
+                  }
+                >
                   <Button
                     type="text"
                     className="context-meter"
@@ -587,7 +993,7 @@ export function ChatPage() {
                       format={(percent) => `${percent ?? 0}%`}
                     />
                     <span className="context-meter-copy">
-                      <strong>上下文</strong>
+                      <strong>{isGenerating ? '执行上下文' : '历史上下文'}</strong>
                       <small>
                         {(conversationContext.data?.estimatedTokens ?? 0).toLocaleString()} /{' '}
                         {(conversationContext.data?.tokenBudget ?? 0).toLocaleString()}
@@ -639,26 +1045,22 @@ export function ChatPage() {
                         ))}
                       </div>
                     ) : null}
-                    {item.content ? (
-                      item.role === 'assistant' ? (
-                        <AssistantMarkdown content={item.content} />
-                      ) : (
-                        item.content
-                          .split('\n')
-                          .map((paragraph, index) =>
-                            paragraph ? (
-                              <p key={`${item.id}-${index}`}>{paragraph}</p>
-                            ) : (
-                              <br key={index} />
-                            ),
-                          )
-                      )
-                    ) : item.role === 'assistant' ? (
-                      <span className="typing-indicator">
-                        <span />
-                        <span />
-                        <span />
-                      </span>
+                    {item.role === 'assistant' ? (
+                      <AssistantResponse
+                        item={item}
+                        active={currentGeneration?.assistantId === item.id}
+                        phase={currentGeneration?.phaseLabel}
+                      />
+                    ) : item.content ? (
+                      item.content
+                        .split('\n')
+                        .map((paragraph, index) =>
+                          paragraph ? (
+                            <p key={`${item.id}-${index}`}>{paragraph}</p>
+                          ) : (
+                            <br key={index} />
+                          ),
+                        )
                     ) : null}
                   </div>
                   {item.role === 'assistant' && item.generatedImages?.length ? (
@@ -736,7 +1138,7 @@ export function ChatPage() {
                       ]}
                     />
                   ) : null}
-                  {item.role === 'assistant' && item.content ? (
+                  {item.role === 'assistant' && item.content && !isDraftResponse(item) ? (
                     <Space className="message-actions" size={4}>
                       <Tooltip title="复制">
                         <Button type="text" size="small" icon={<CopyOutlined />} />
@@ -756,6 +1158,47 @@ export function ChatPage() {
         </StateCard>
 
         <div className="composer-wrap">
+          {pendingQuestion && pendingQuestion.requires_input !== false ? (
+            <div className="execution-question-banner" role="status">
+              <Tag color="warning">等待你的答复</Tag>
+              <span>{interruptCopy(pendingQuestion).question}</span>
+              <Button
+                size="small"
+                disabled={isGenerating}
+                onClick={() => showInterrupt(pendingQuestion)}
+              >
+                回答并继续
+              </Button>
+            </div>
+          ) : null}
+          {planMessage?.executionPlan ? (
+            <section className="plan-dock" aria-label="当前任务计划">
+              <TaskPlan
+                key={`${conversationId}-${planMessage.id}`}
+                plan={planMessage.executionPlan}
+                active={currentGeneration?.assistantId === planMessage.id}
+                disabled={isGenerating}
+                onContinue={() => {
+                  if (isGenerating) return;
+                  if (pendingQuestion && pendingQuestion.requires_input !== false) {
+                    showInterrupt(pendingQuestion);
+                    return;
+                  }
+                  const plan = {
+                    ...planMessage.executionPlan,
+                    tasks: planMessage.executionPlan!.tasks.map((task) => ({
+                      ...task,
+                      result: task.result.slice(0, 250),
+                    })),
+                  };
+                  void sendMessage(
+                    `继续执行这份任务计划的剩余步骤，先恢复已完成结果，更新计划后继续。完整结果参考此前记录。计划：${JSON.stringify(plan)}`,
+                    true,
+                  );
+                }}
+              />
+            </section>
+          ) : null}
           {toolStatus ? (
             <div className="tool-status" role="status">
               <GlobalOutlined spin={isGenerating} />
@@ -820,6 +1263,18 @@ export function ChatPage() {
               />
               <div className="composer-footer">
                 <div className="composer-actions-left">
+                  <Tooltip title="开启后先拆解任务，再逐步执行；关闭时由助手判断是否需要计划">
+                    <Button
+                      type={usePlan ? 'primary' : 'text'}
+                      size="small"
+                      icon={<UnorderedListOutlined />}
+                      aria-pressed={usePlan}
+                      disabled={isGenerating}
+                      onClick={() => setUsePlan((value) => !value)}
+                    >
+                      任务计划
+                    </Button>
+                  </Tooltip>
                   <Upload
                     accept={attachmentAccept}
                     multiple={false}
@@ -883,6 +1338,76 @@ export function ChatPage() {
           </Button>
         </div>
       </main>
+      <Modal
+        open={Boolean(interruptDialog)}
+        title={
+          dialogCopy?.problems?.some((item) => item.includes('截断'))
+            ? '方案还没有输出完整'
+            : dialogCopy?.kind === 'error'
+              ? '进度已保存，可继续处理'
+              : '需要确认的问题'
+        }
+        centered
+        styles={{ body: { maxHeight: '55vh', overflowY: 'auto' } }}
+        onCancel={dismissQuestion}
+        footer={[
+          <Button key="later" onClick={dismissQuestion}>
+            稍后处理
+          </Button>,
+          <Button
+            key="cancel"
+            danger
+            disabled={isGenerating}
+            onClick={() => submitQuestion('cancel')}
+          >
+            结束任务
+          </Button>,
+          <Button
+            key="continue"
+            type="primary"
+            disabled={isGenerating || (!interruptOption && !interruptAnswer.trim())}
+            onClick={() => submitQuestion('continue')}
+          >
+            提交并继续
+          </Button>,
+        ]}
+      >
+        <p>
+          <strong>{dialogCopy?.question}</strong>
+        </p>
+        <p>{dialogCopy?.reason}</p>
+        {dialogCopy?.problems?.length ? (
+          <ul className="execution-interrupt-problems">
+            {dialogCopy.problems.map((problem) => (
+              <li key={problem}>{problem}</li>
+            ))}
+          </ul>
+        ) : null}
+        {dialogCopy?.recommendation ? (
+          <p className="execution-interrupt-recommendation">{dialogCopy.recommendation}</p>
+        ) : null}
+        <Space wrap className="execution-interrupt-options">
+          {dialogCopy?.options.map((option) => (
+            <Button
+              key={option}
+              type={interruptOption === option ? 'primary' : 'default'}
+              onClick={() => setInterruptOption(option)}
+              aria-pressed={interruptOption === option}
+            >
+              {option}
+            </Button>
+          ))}
+        </Space>
+        <Input.TextArea
+          aria-label="补充说明或自定义回答"
+          placeholder="有其他安排？可以在这里补充，也可以直接选择上方选项。"
+          value={interruptAnswer}
+          onChange={(event) => setInterruptAnswer(event.target.value)}
+          autoSize={{ minRows: 3, maxRows: 7 }}
+          maxLength={5000}
+          style={{ marginTop: 16 }}
+        />
+      </Modal>
       <Modal
         title="重命名会话"
         open={Boolean(renamingConversation)}
