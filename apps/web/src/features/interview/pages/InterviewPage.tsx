@@ -6,7 +6,6 @@ import {
   ForwardOutlined,
   PhoneOutlined,
   PoweroffOutlined,
-  RedoOutlined,
   SafetyCertificateOutlined,
   SoundOutlined,
 } from '@ant-design/icons';
@@ -71,9 +70,66 @@ export function InterviewPage() {
   const [session, setSession] = useState<InterviewSession>();
   const [report, setReport] = useState<InterviewReport>();
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [phase, setPhase] = useState<'setup' | 'connecting' | 'active' | 'ended'>('setup');
+  const [agentSubtitle, setAgentSubtitle] = useState('');
+  const [visibleSubtitle, setVisibleSubtitle] = useState('');
+  const [answerPhase, setAnswerPhase] = useState<'waiting' | 'preparing' | 'answering' | 'finished'>('waiting');
+  const [questionDeadline, setQuestionDeadline] = useState(0);
+  const [remainingSeconds, setRemainingSeconds] = useState(30);
+
+  const receiveSubtitle = useCallback((text: string, newRound: boolean) => {
+    setAgentSubtitle(text);
+    if (newRound) {
+      setVisibleSubtitle('');
+      setAnswerPhase('preparing');
+      setQuestionDeadline(Date.now() + 30_000);
+      setRemainingSeconds(30);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (visibleSubtitle === agentSubtitle) return;
+    const timer = window.setTimeout(() => {
+      setVisibleSubtitle((current) => agentSubtitle.slice(0, current.length + 1));
+    }, 45);
+    return () => window.clearTimeout(timer);
+  }, [agentSubtitle, visibleSubtitle]);
+
+  const beginAnswer = useMutation({
+    mutationFn: () => rtcRef.current.setAnswering(true),
+    onSuccess: () => {
+      setAnswerPhase('answering');
+      setQuestionDeadline(Date.now() + 180_000);
+      setRemainingSeconds(180);
+    },
+    onError: () => message.error('麦克风启动失败，请重试'),
+  });
+
+  const automaticStartDeadline = useRef(0);
+
+  useEffect(() => {
+    if (phase !== 'active' || !questionDeadline || !['preparing', 'answering'].includes(answerPhase)) return;
+    const update = () => {
+      const remaining = Math.max(0, Math.ceil((questionDeadline - Date.now()) / 1000));
+      setRemainingSeconds(remaining);
+      if (!remaining && answerPhase === 'preparing' && automaticStartDeadline.current !== questionDeadline) {
+        automaticStartDeadline.current = questionDeadline;
+        beginAnswer.mutate();
+      }
+      if (!remaining && answerPhase === 'answering') {
+        setAnswerPhase('finished');
+        void rtcRef.current.setAnswering(false).catch(() => message.error('关闭麦克风失败，请结束面试'));
+      }
+    };
+    update();
+    const timer = window.setInterval(update, 250);
+    return () => window.clearInterval(timer);
+  }, [answerPhase, questionDeadline, phase, message, beginAnswer.mutate]);
+
+
   const [mediaReady, setMediaReady] = useState(false);
   const [transcriptionEnabled, setTranscriptionEnabled] = useState(true);
-  const [phase, setPhase] = useState<'setup' | 'connecting' | 'active' | 'ended'>('setup');
+
   const readiness = useQuery({
     queryKey: ['interview-readiness'],
     queryFn: apiClient.getInterviewReadiness,
@@ -139,11 +195,15 @@ export function InterviewPage() {
       setSession(created);
       setReport(undefined);
       transcriptRef.current = [];
+      setAgentSubtitle('');
+      setVisibleSubtitle('');
+      setAnswerPhase('waiting');
+      setQuestionDeadline(0);
       try {
         if (created.enableAvatar) {
           await avatarRef.current.start(created);
         } else {
-          const enabled = await rtcRef.current.join(created, recordTranscript);
+          const enabled = await rtcRef.current.join(created, recordTranscript, receiveSubtitle);
           setTranscriptionEnabled(enabled);
           await apiClient.startInterviewSession(created.id);
         }
@@ -193,6 +253,8 @@ export function InterviewPage() {
   const controlInterview = useMutation({
     mutationFn: async (command: 'next' | 'repeat') => {
       if (!session || session.enableAvatar) return;
+      await rtcRef.current.setAnswering(false);
+      setAnswerPhase('waiting');
       const prompt = command === 'next'
         ? '候选人请求下一题。请结束当前问题，从面经题库选择一个尚未问过的新问题，只问一个问题，不要解释。'
         : '请简洁重复你刚才提出的问题，不要给答案，也不要切换到新问题。';
@@ -303,25 +365,44 @@ export function InterviewPage() {
           </Space>
         </header>
         <div className="interview-room-grid">
-          <Card className="interviewer-stage">
+          <Card className={`interviewer-stage${session?.enableAvatar ? "" : " voice-interview-stage"}`}>
             {session?.enableAvatar ? (
               <div ref={avatarContainerRef} className="avatar-video-canvas" />
             ) : (
-              <div className="voice-interviewer-placeholder"><CustomerServiceOutlined /></div>
+              <div className="voice-interviewer-portrait-panel">
+                <p className="interview-stage-hint">{answerPhase === 'answering' ? '正在录音，每题最多作答 3 分钟。' : answerPhase === 'finished' ? '麦克风已关闭，点击“下一题”继续面试。' : '准备阶段不录音、不记录回答；30 秒后自动开始，也可点击“我准备好了”提前作答。'}</p>
+                <img className="voice-interviewer-portrait" src="/images/interviewer.png" alt="AI 面试官" />
+                <strong>面试官</strong>
+                <div className="interview-stage-countdown" aria-live="polite">
+                <Tag color={answerPhase === 'answering' ? 'green' : 'default'}>
+                  {answerPhase === 'preparing' ? `思考时间 ${remainingSeconds}s` : answerPhase === 'answering' ? `作答剩余 ${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, '0')}` : answerPhase === 'finished' ? '本题作答已结束' : '等待面试官提问'}
+                </Tag>
+
+                </div>
+                <Progress className="interview-stage-timebar" percent={['preparing', 'answering'].includes(answerPhase) ? remainingSeconds / (answerPhase === 'preparing' ? 30 : 180) * 100 : 0} showInfo={false} strokeColor="#347565" strokeLinecap="butt" />
+              </div>
             )}
             {phase === 'active' ? (
               <div className="interview-question-panel">
                 <Typography.Title level={3}>
-                  {mediaReady || !session?.enableAvatar ? '实时语音面试中' : '数字人正在进入面试间'}
+                  {!session?.enableAvatar ? '面试官' : mediaReady ? '实时语音面试中' : '数字人正在进入面试间'}
                 </Typography.Title>
                 <p>
-                  {mediaReady || !session?.enableAvatar
+                  {!session?.enableAvatar
+                    ? visibleSubtitle || '正在等待面试官讲话，请通过麦克风回答。'
+                    : mediaReady
                     ? '请直接通过麦克风回答。面试官会根据你的回答连续追问；想跳过时直接说“继续”或“下一题”。'
                     : '正在加载数字人画面和实时语音，请稍候。'}
                 </p>
               </div>
             ) : (
               <p>本次语音面试已经结束。面试报告将在后续版本接入。</p>
+            )}
+            {!session?.enableAvatar && (
+              <div className="interview-answer-timer" aria-live="polite">
+                {answerPhase === 'preparing' && <Button type="primary" loading={beginAnswer.isPending} onClick={() => { automaticStartDeadline.current = questionDeadline; beginAnswer.mutate(); }}>我准备好了</Button>}
+
+              </div>
             )}
             <div className="voice-status">
               <SoundOutlined />
@@ -335,15 +416,14 @@ export function InterviewPage() {
             </div>
             {!session?.enableAvatar ? (
               <Space className="interview-voice-controls" wrap>
-                <Button
-                  icon={<RedoOutlined />}
-                  loading={controlInterview.isPending && controlInterview.variables === 'repeat'}
-                  disabled={controlInterview.isPending}
-                  onClick={() => controlInterview.mutate('repeat')}
-                >
-                  重复问题
-                </Button>
-                <Button
+                {answerPhase === 'answering' && <Button type="primary" onClick={async () => {
+                  try {
+                    await rtcRef.current.setAnswering(false);
+                    setAnswerPhase('finished');
+                    setQuestionDeadline(0);
+                  } catch { message.error('关闭麦克风失败，请重试'); }
+                }}>回答完毕</Button>}
+                {answerPhase === 'finished' && <Button
                   type="primary"
                   icon={<ForwardOutlined />}
                   loading={controlInterview.isPending && controlInterview.variables === 'next'}
@@ -351,7 +431,7 @@ export function InterviewPage() {
                   onClick={() => controlInterview.mutate('next')}
                 >
                   下一题
-                </Button>
+                </Button>}
               </Space>
             ) : null}
             {!transcriptionEnabled && (mediaReady || !session?.enableAvatar) ? (

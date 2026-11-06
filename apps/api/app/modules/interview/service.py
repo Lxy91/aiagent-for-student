@@ -152,7 +152,7 @@ class InterviewService:
                     },
                 },
                 "InterruptMode": 0,
-                "SubtitleConfig": {"SubtitleMode": 3},
+                "SubtitleConfig": {"SubtitleMode": 3, "DisableRTSSubtitle": False},
                 "FunctionCallingConfig": {},
                 "WebSearchAgentConfig": {},
                 "MemoryConfig": {},

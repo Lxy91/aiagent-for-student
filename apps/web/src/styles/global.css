@@ -2246,3 +2246,89 @@ button {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Voice interview: portrait above a separate, left-aligned reading area. */
+.voice-interview-stage { background: #fff; }
+.voice-interview-stage .ant-card-body {
+  justify-content: flex-start;
+  padding: clamp(18px, 3vw, 36px);
+}
+.voice-interviewer-portrait-panel {
+  width: 100%;
+  min-height: 300px;
+  height: clamp(300px, 42vh, 440px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  border: 1px solid rgb(52 117 101 / 18%);
+  border-radius: 18px;
+  background: #edf3ee;
+  color: #347565;
+  font-size: 18px;
+}
+.voice-interviewer-portrait {
+  width: clamp(140px, 18vw, 200px);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.voice-interview-stage .interview-question-panel {
+  width: 100%;
+  margin: 0;
+  padding: 28px 0 36px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  flex: 1;
+}
+.voice-interview-stage .interview-question-panel .ant-typography { font-size: 18px; }
+.voice-interview-stage .interview-question-panel p {
+  max-width: none;
+  margin: 12px 0 0;
+  font-size: 17px;
+  line-height: 1.9;
+}
+
+.voice-interview-stage .ant-card-body { position: relative; padding-top: 48px; }
+.voice-interview-stage .voice-status {
+  position: absolute;
+  top: 12px;
+  right: clamp(18px, 3vw, 36px);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 12px;
+}
+.voice-interviewer-portrait-panel {
+  position: relative;
+  overflow: hidden;
+  padding: 64px 20px 70px;
+  height: auto;
+  min-height: 380px;
+}
+.voice-interview-stage .interview-stage-hint {
+  position: absolute;
+  top: 16px;
+  left: 20px;
+  right: 20px;
+  max-width: none;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.interview-stage-countdown { position: absolute; bottom: 25px; }
+.interview-stage-timebar.ant-progress {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  margin: 0;
+  line-height: 0;
+}
+.interview-stage-timebar .ant-progress-outer { padding: 0; }
+.interview-stage-timebar .ant-progress-inner { border-radius: 0; }
+.interview-answer-timer:empty { display: none; }
