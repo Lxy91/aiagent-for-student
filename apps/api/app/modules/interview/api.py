@@ -141,7 +141,7 @@ async def complete_session(session_id: UUID, payload: GenerateInterviewReportReq
 def cleanup_interview_history():
     import time
     import shutil
-    cutoff = time.time() - 3 * 86400
+    cutoff = time.time() - 30 * 86400
     for owner in _history_dir.glob("*"):
         if not owner.is_dir():
             continue
@@ -181,19 +181,43 @@ async def upload_clip(session_id: UUID, current_user: CurrentUserDep, settings: 
         await video.close()
     import asyncio
     await asyncio.to_thread(normalize_recording, target)
+    import hashlib
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
     manifest = directory / "clips.json"
     clips = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else []
-    clips.append({"id": clip_id, "question": question[:4000], "main": main, "followUp": follow_up})
+    existing = next((item for item in clips if item.get("sha256") == digest), None)
+    if existing:
+        target.unlink(missing_ok=True)
+        return {"id": existing["id"]}
+    storage = settings.interview_storage
+    if storage == "tos":
+        key = f"interviews/{current_user.id}/{session_id}/{clip_id}.webm"
+        def upload():
+            with target.open("rb") as stream:
+                tos_client(settings).put_object(Bucket=settings.tos_bucket, Key=key, Body=stream, ContentType="video/webm")
+        await asyncio.to_thread(upload)
+    elif storage != "local":
+        raise HTTPException(503, "未知面试存储配置")
+    clips.append({"sha256": digest, "id": clip_id, "question": question[:4000], "main": main, "followUp": follow_up, "storage": storage, "key": key if storage == "tos" else None})
     manifest.write_text(json.dumps(clips, ensure_ascii=False), encoding="utf-8")
+    if storage == "tos":
+        target.unlink(missing_ok=True)
     return {"id": clip_id}
 
 
 @router.get("/history/{session_id}/clips/{clip_id}")
-async def read_clip(session_id: UUID, clip_id: UUID, current_user: CurrentUserDep):
+async def read_clip(session_id: UUID, clip_id: UUID, current_user: CurrentUserDep, settings: SettingsDep):
     cleanup_interview_history()
     target = _history_dir / str(current_user.id) / str(session_id) / (clip_id.hex + ".webm")
+    manifest = target.parent / "clips.json"
+    if manifest.exists():
+        clip = next((item for item in json.loads(manifest.read_text(encoding="utf-8")) if item["id"] == clip_id.hex), None)
+        if clip and clip.get("storage") == "tos":
+            from fastapi.responses import RedirectResponse
+            url = tos_client(settings).generate_presigned_url("get_object", Params={"Bucket": settings.tos_bucket, "Key": clip["key"]}, ExpiresIn=900)
+            return {"url": url}
     if not target.is_file():
-        raise HTTPException(404, "录像不存在或已过三天保留期")
+        raise HTTPException(404, "录像不存在或已过30天保留期")
     return FileResponse(target, media_type="video/webm")
 
 
@@ -210,3 +234,15 @@ def normalize_recording(target: Path):
         temporary.replace(target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def tos_client(settings):
+    import boto3
+    from botocore.config import Config
+    if not settings.tos_access_key_id or not settings.tos_secret_access_key:
+        raise HTTPException(503, "请配置后端 TOS_ACCESS_KEY_ID 和 TOS_SECRET_ACCESS_KEY")
+    return boto3.client("s3", endpoint_url=settings.tos_endpoint, region_name=settings.tos_region,
+                        aws_access_key_id=settings.tos_access_key_id,
+                        aws_secret_access_key=settings.tos_secret_access_key,
+                        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"},
+                                      request_checksum_calculation="when_required", response_checksum_validation="when_required"))

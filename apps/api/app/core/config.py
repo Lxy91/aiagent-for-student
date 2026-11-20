@@ -14,6 +14,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    interview_storage: str = "local"
+    tos_bucket: str = "aiagent-interview-videos"
+    tos_region: str = "cn-shanghai"
+    tos_endpoint: str = "https://tos-s3-cn-shanghai.volces.com"
+    tos_access_key_id: str = ""
+    tos_secret_access_key: str = ""
+
     app_name: str = "大学生职场适应智能体 API"
     app_version: str = "0.3.0"
     app_env: str = "development"

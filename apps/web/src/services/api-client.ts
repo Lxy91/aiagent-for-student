@@ -881,5 +881,7 @@ export async function uploadInterviewClip(id: string, clip: {url: string; questi
   await request(`/interviews/sessions/${id}/clips`, { method: 'POST', body });
 }
 export async function loadInterviewClip(id: string, clipId: string) {
-  return URL.createObjectURL(await request<Blob>(`/interviews/history/${id}/clips/${clipId}`, {}, true, 'blob'));
+  const blob = await request<Blob>(`/interviews/history/${id}/clips/${clipId}`, {}, true, 'blob');
+  if (blob.type.includes('application/json')) return (JSON.parse(await blob.text()) as {url: string}).url;
+  return URL.createObjectURL(blob);
 }

@@ -8,6 +8,7 @@ version = "0.3.0"
 description = "大学生职场适应智能体 V0.3 后端"
 requires-python = ">=3.12"
 dependencies = [
+  "boto3>=1.35,<2",
   "alembic>=1.18,<2",
   "asyncmy>=0.2.10,<1",
   "cryptography>=44,<51",

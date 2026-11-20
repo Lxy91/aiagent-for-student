@@ -266,6 +266,7 @@ export function InterviewPage() {
       clips.forEach(clip => URL.revokeObjectURL(clip.url));
       setClips([]);
       clipsRef.current = [];
+      completionRef.current = false;
       roundRef.current = 1;
       followUpRef.current = false;
       reverseRef.current = false;
@@ -309,8 +310,11 @@ export function InterviewPage() {
     },
   });
 
+  const completionRef = useRef(false);
   const stopInterview = useMutation({
     mutationFn: async () => {
+      if (completionRef.current) return;
+      completionRef.current = true;
       await saveRecording();
       await avatarRef.current.end();
       await rtcRef.current.leave();
@@ -446,7 +450,7 @@ export function InterviewPage() {
                 }),
               }))} />
               {!clips.length && <Tabs items={report.qaReviews.map((item,index) => ({ key: String(index), label: `问题${index+1}`, children: <div><h3>{item.question}</h3><p>你的回答：{item.answer}</p><p>考察点：{item.assessment}</p><p>分析：{item.feedback}</p><p>AI 推荐回答：{item.sampleAnswer}</p></div> }))} />}
-              <p>录像与面试记录保存三天，到期自动清理。</p>
+              <p>录像与面试记录保存30天，到期自动清理。</p>
             </Card>
             <div className="interview-report-columns">
               <Card title="表现亮点"><List dataSource={report.strengths} renderItem={(item) => <List.Item>{item}</List.Item>} /></Card>
@@ -462,8 +466,8 @@ export function InterviewPage() {
 
   if (showHistory) {
     return <div className="page-container interview-page">
-      <PageHeader title="面试记录" description="查看近三天的面试报告和逐题录像，到期自动清理。" action={<Button onClick={() => navigate('/interview')}>返回面试入口</Button>} />
-      <Card title="面试记录（保留三天）"><List loading={history.isLoading} dataSource={history.data ?? []} locale={{ emptyText: '暂无面试记录' }} renderItem={item => <List.Item actions={[<Button key="view" disabled={!item.report} onClick={async () => { try { const saved = await Promise.all((item.clips ?? []).map(async clip => ({ ...clip, answer: '', url: await loadInterviewClip(item.id, clip.id) }))); setReport(item.report); setClips(saved); setPhase('ended'); } catch { message.error('录像加载失败，请重试'); } }}>查看报告</Button>]}><List.Item.Meta title={new Date(item.created_at).toLocaleString()} description={item.status === 'completed' ? '报告已生成' : item.status === 'failed' ? '报告生成失败' : '报告生成中'} /></List.Item>} /></Card>
+      <PageHeader title="面试记录" description="查看近30天的面试报告和逐题录像，到期自动清理。" action={<Button onClick={() => navigate('/interview')}>返回面试入口</Button>} />
+      <Card title="面试记录（保留30天）"><List loading={history.isLoading} dataSource={history.data ?? []} locale={{ emptyText: '暂无面试记录' }} renderItem={item => <List.Item actions={[<Button key="view" disabled={!item.report} onClick={async () => { try { const saved = await Promise.all((item.clips ?? []).map(async clip => ({ ...clip, answer: '', url: await loadInterviewClip(item.id, clip.id) }))); setReport(item.report); setClips(saved); setPhase('ended'); } catch { message.error('录像加载失败，请重试'); } }}>查看报告</Button>]}><List.Item.Meta title={new Date(item.created_at).toLocaleString()} description={item.status === 'completed' ? '报告已生成' : item.status === 'failed' ? '报告生成失败' : '报告生成中'} /></List.Item>} /></Card>
     </div>;
   }
 
