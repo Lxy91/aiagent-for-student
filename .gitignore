@@ -16,3 +16,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+
+# Local interview recordings, reports and diagnostics
+apps/api/data/interview_reports/
+apps/api/data/logs/

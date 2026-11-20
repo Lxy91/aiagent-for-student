@@ -247,6 +247,7 @@ export interface InterviewSession {
 }
 
 export interface InterviewTranscriptEntry {
+  question?: string;
   text: string;
   recordedAtSeconds: number;
 }
@@ -263,6 +264,8 @@ export interface InterviewQaReview {
   answer: string;
   score: number;
   feedback: string;
+  assessment?: string;
+  sampleAnswer?: string;
 }
 
 export interface InterviewReport {

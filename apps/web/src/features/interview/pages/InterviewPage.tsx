@@ -1,3 +1,4 @@
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   AudioOutlined,
   CheckCircleFilled,
@@ -28,10 +29,12 @@ import {
   Switch,
   Tag,
   Typography,
+  Tooltip,
+  Tabs,
 } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PageHeader } from '../../../components/PageHeader';
-import { apiClient } from '../../../services/api-client';
+import { uploadInterviewClip, loadInterviewClip, completeInterview, getInterviewHistory, apiClient } from '../../../services/api-client';
 import type {
   InterviewDifficulty,
   InterviewReport,
@@ -61,12 +64,60 @@ const initialValues: SetupValues = {
 
 export function InterviewPage() {
   const { message, modal } = App.useApp();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const showHistory = location.pathname === '/interview/history';
+  const history = useQuery({ queryKey: ['interview-history'], queryFn: getInterviewHistory, enabled: showHistory, refetchInterval: showHistory ? 5000 : false });
+  const camera = useRef<MediaStream | null>(null);
+  const recorder = useRef<MediaRecorder | null>(null);
+  const attachCameraPreview = useCallback((element: HTMLVideoElement | null) => {
+    if (element && element.srcObject !== camera.current) {
+      element.srcObject = camera.current;
+    }
+  }, []);
+  const [clips, setClips] = useState<Array<{ question: string; url: string; main: number; followUp: boolean; answer: string }>>([]);
+  const clipsRef = useRef(clips);
+  const questionRef = useRef('自我介绍');
+  const roundRef = useRef(1);
+  const followUpRef = useRef(false);
+  const reverseRef = useRef(false);
+  const answerStartRef = useRef(0);
+  const stopClip = useCallback(async () => {
+    const active = recorder.current;
+    if (active && active.state !== 'inactive') await new Promise<void>(resolve => {
+      active.addEventListener('stop', () => resolve(), { once: true });
+      active.stop();
+    });
+  }, []);
+  const startClip = () => {
+    if (!camera.current || recorder.current?.state === 'recording') return;
+    const chunks: Blob[] = [];
+    const question = questionRef.current;
+    const main = roundRef.current;
+    const followUp = followUpRef.current;
+    answerStartRef.current = transcriptRef.current.length;
+    const capture = new MediaRecorder(camera.current);
+    recorder.current = capture;
+    capture.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+    capture.onstop = () => {
+      const url = URL.createObjectURL(new Blob(chunks, { type: capture.mimeType }));
+      clipsRef.current = [...clipsRef.current, { question, url, main, followUp, answer: transcriptRef.current.slice(answerStartRef.current).map(entry => entry.text).join(' ') }];
+      setClips(clipsRef.current);
+    };
+    capture.start(1000);
+  };
+  const saveRecording = async () => {
+    await stopClip();
+    camera.current?.getTracks().forEach(track => track.stop());
+  };
   const avatarRef = useRef(new InterviewAvatarClient());
   const rtcRef = useRef(new InterviewRtcClient());
   const avatarContainerRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<InterviewSession | undefined>(undefined);
   const elapsedRef = useRef(0);
   const transcriptRef = useRef<InterviewTranscriptEntry[]>([]);
+  const controlInFlightRef = useRef(false);
+  const controlRequestIdRef = useRef(0);
   const [session, setSession] = useState<InterviewSession>();
   const [report, setReport] = useState<InterviewReport>();
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -74,18 +125,27 @@ export function InterviewPage() {
   const [agentSubtitle, setAgentSubtitle] = useState('');
   const [visibleSubtitle, setVisibleSubtitle] = useState('');
   const [answerPhase, setAnswerPhase] = useState<'waiting' | 'preparing' | 'answering' | 'finished'>('waiting');
+  const [interviewQuestionsFinished, setInterviewQuestionsFinished] = useState(false);
   const [questionDeadline, setQuestionDeadline] = useState(0);
   const [remainingSeconds, setRemainingSeconds] = useState(30);
 
   const receiveSubtitle = useCallback((text: string, newRound: boolean) => {
+    if (reverseRef.current && !/反问时间|本场面试问答环节已结束/.test(text)) return;
+    questionRef.current = text;
     setAgentSubtitle(text);
+    if (/题库.*(全部|所有).*(提问完毕|问完)|没有剩余.*新问题|问答环节.*结束/.test(text)) {
+      setAnswerPhase('finished');
+      setQuestionDeadline(0);
+      void rtcRef.current.setAnswering(false).catch(() => message.error('关闭麦克风失败，请结束面试'));
+      return;
+    }
     if (newRound) {
       setVisibleSubtitle('');
       setAnswerPhase('preparing');
       setQuestionDeadline(Date.now() + 30_000);
       setRemainingSeconds(30);
     }
-  }, []);
+  }, [message]);
 
   useEffect(() => {
     if (visibleSubtitle === agentSubtitle) return;
@@ -96,13 +156,20 @@ export function InterviewPage() {
   }, [agentSubtitle, visibleSubtitle]);
 
   const beginAnswer = useMutation({
-    mutationFn: () => rtcRef.current.setAnswering(true),
+    mutationFn: async () => {
+      await rtcRef.current.setAnswering(true);
+      startClip();
+    },
     onSuccess: () => {
+      automaticStartDeadline.current = 0;
       setAnswerPhase('answering');
       setQuestionDeadline(Date.now() + 180_000);
       setRemainingSeconds(180);
     },
-    onError: () => message.error('麦克风启动失败，请重试'),
+    onError: () => {
+      setAnswerPhase('preparing');
+      message.error('麦克风启动失败，请检查麦克风权限后点击“我准备好了”重试');
+    },
   });
 
   const automaticStartDeadline = useRef(0);
@@ -112,11 +179,12 @@ export function InterviewPage() {
     const update = () => {
       const remaining = Math.max(0, Math.ceil((questionDeadline - Date.now()) / 1000));
       setRemainingSeconds(remaining);
-      if (!remaining && answerPhase === 'preparing' && automaticStartDeadline.current !== questionDeadline) {
+      if (!remaining && answerPhase === 'preparing' && !beginAnswer.isPending && automaticStartDeadline.current !== questionDeadline) {
         automaticStartDeadline.current = questionDeadline;
         beginAnswer.mutate();
       }
       if (!remaining && answerPhase === 'answering') {
+        void stopClip();
         setAnswerPhase('finished');
         void rtcRef.current.setAnswering(false).catch(() => message.error('关闭麦克风失败，请结束面试'));
       }
@@ -124,7 +192,7 @@ export function InterviewPage() {
     update();
     const timer = window.setInterval(update, 250);
     return () => window.clearInterval(timer);
-  }, [answerPhase, questionDeadline, phase, message, beginAnswer.mutate]);
+  }, [answerPhase, questionDeadline, phase, message, beginAnswer.isPending, beginAnswer.mutate]);
 
 
   const [mediaReady, setMediaReady] = useState(false);
@@ -161,6 +229,8 @@ export function InterviewPage() {
       if (sessionRef.current?.status === 'active') {
         void apiClient.stopInterviewSession(sessionRef.current.id);
       }
+      recorder.current?.state === "recording" && recorder.current.stop();
+      camera.current?.getTracks().forEach(track => track.stop());
       void avatarRef.current.end();
       void rtcRef.current.leave();
     },
@@ -191,6 +261,14 @@ export function InterviewPage() {
   const startInterview = useMutation({
     mutationFn: async (values: SetupValues) => {
       setPhase('connecting');
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error('请使用支持摄像头录制的浏览器，并通过 HTTPS 或 localhost 访问');
+      camera.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      clips.forEach(clip => URL.revokeObjectURL(clip.url));
+      setClips([]);
+      clipsRef.current = [];
+      roundRef.current = 1;
+      followUpRef.current = false;
+      reverseRef.current = false;
       const created = await apiClient.createInterviewSession(values);
       setSession(created);
       setReport(undefined);
@@ -199,6 +277,7 @@ export function InterviewPage() {
       setVisibleSubtitle('');
       setAnswerPhase('waiting');
       setQuestionDeadline(0);
+      setInterviewQuestionsFinished(false);
       try {
         if (created.enableAvatar) {
           await avatarRef.current.start(created);
@@ -221,6 +300,7 @@ export function InterviewPage() {
       setPhase('active');
     },
     onError: async (error) => {
+      await saveRecording();
       await avatarRef.current.end();
       await rtcRef.current.leave();
       setMediaReady(false);
@@ -231,16 +311,18 @@ export function InterviewPage() {
 
   const stopInterview = useMutation({
     mutationFn: async () => {
+      await saveRecording();
       await avatarRef.current.end();
       await rtcRef.current.leave();
       if (!session) return undefined;
-      await apiClient.stopInterviewSession(session.id);
-      return apiClient.generateInterviewReport(session.id, transcriptRef.current);
+      for (const clip of clipsRef.current) await uploadInterviewClip(session.id, clip);
+      return completeInterview(session.id, clipsRef.current.map(clip => ({ text: clip.answer, question: clip.question, recordedAtSeconds: 0 })));
     },
-    onSuccess: (generatedReport) => {
+    onSuccess: () => {
       setMediaReady(false);
-      setReport(generatedReport);
-      setPhase('ended');
+      setReport(undefined);
+      setPhase('setup');
+      message.success('面试已完成，报告正在后台生成，可在面试记录查看');
       setSession((value) => (value ? { ...value, status: 'stopped' } : value));
     },
     onError: (error) => {
@@ -253,18 +335,58 @@ export function InterviewPage() {
   const controlInterview = useMutation({
     mutationFn: async (command: 'next' | 'repeat') => {
       if (!session || session.enableAvatar) return;
-      await rtcRef.current.setAnswering(false);
+      const requestId = ++controlRequestIdRef.current;
+      controlInFlightRef.current = true;
       setAnswerPhase('waiting');
-      const prompt = command === 'next'
-        ? '候选人请求下一题。请结束当前问题，从面经题库选择一个尚未问过的新问题，只问一个问题，不要解释。'
-        : '请简洁重复你刚才提出的问题，不要给答案，也不要切换到新问题。';
-      await rtcRef.current.askAgent(session.agentUserId, prompt);
+      setQuestionDeadline(0);
+      try {
+        await rtcRef.current.setAnswering(false);
+        await stopClip();
+        if (command === 'repeat') {
+          await rtcRef.current.askAgent(session.agentUserId, '请仅重复当前问题，不得换题。');
+        } else if (reverseRef.current) {
+          setInterviewQuestionsFinished(true);
+          setAnswerPhase('finished');
+          await stopInterview.mutateAsync();
+        } else if (!followUpRef.current && elapsedRef.current < session.durationMinutes * 60 - 120 &&
+          transcriptRef.current.slice(answerStartRef.current).length > 0 &&
+          await rtcRef.current.decideNextAction(session.agentUserId, transcriptRef.current.slice(answerStartRef.current).map(entry => entry.text).join(' ')) === 'follow_up') {
+          await rtcRef.current.askAgent(session.agentUserId, `针对当前第${roundRef.current}道主问题的回答追问一个具体细节，不得切换主题。本次属于追问，不增加主问题计数。`);
+          followUpRef.current = true;
+        } else if (roundRef.current >= 8 || elapsedRef.current >= session.durationMinutes * 60 - 120) {
+          reverseRef.current = true;
+          roundRef.current = 9;
+          followUpRef.current = false;
+          const invitation = '考察环节已经完成。接下来是你的反问时间，你有什么想了解或想问我的问题吗？没有也可以直接结束并生成报告。';
+          receiveSubtitle(invitation, true);
+          await rtcRef.current.speak(session.agentUserId, invitation);
+        } else {
+          const nextRound = roundRef.current + 1;
+          const stage = session.interviewType === 'hr' ? 'HR' : session.interviewType === 'mixed' && nextRound >= 6 ? 'HR' : '技术';
+          await rtcRef.current.askAgent(session.agentUserId,
+            `当前是第 ${nextRound}/8 题，属于${stage}阶段。严格只问一道尚未问过的${stage}问题。${stage === 'HR' ? '技术阶段已结束，禁止返回技术八股或技术追问。' : '围绕题库进行技术考察。'}不要自行继续提问，等待用户点击下一题。`);
+          roundRef.current = nextRound;
+          followUpRef.current = false;
+        }
+      } catch (error) {
+        if (controlRequestIdRef.current === requestId) {
+          controlInFlightRef.current = false;
+          setAnswerPhase('finished');
+        }
+        throw error;
+      }
+      if (controlRequestIdRef.current === requestId) controlInFlightRef.current = false;
     },
     onSuccess: (_, command) => {
-      message.success(command === 'next' ? '已请求下一题' : '已请求重复问题');
+      message.success(command === 'next' ? '面试官已开始下一题' : '面试官正在重复问题');
     },
     onError: (error) => message.error(error instanceof Error ? error.message : '操作失败'),
+    onSettled: () => {
+      controlInFlightRef.current = false;
+    },
   });
+
+  const waitingForQuestion = controlInterview.isPending && answerPhase === 'waiting';
 
   const elapsed = useMemo(() => {
     const minutes = Math.floor(elapsedSeconds / 60).toString().padStart(2, '0');
@@ -282,7 +404,7 @@ export function InterviewPage() {
         <header className="interview-room-header">
           <div><Tag color="success">面试已结束</Tag><strong>前端模拟面试报告</strong></div>
           <Button onClick={() => { setSession(undefined); setReport(undefined); setPhase('setup'); }}>
-            再面一次
+            {showHistory ? '返回面试记录' : '再面一次'}
           </Button>
         </header>
         {report ? (
@@ -295,30 +417,36 @@ export function InterviewPage() {
               <Card title="面试结论"><Typography.Paragraph>{report.summary}</Typography.Paragraph></Card>
             </div>
             <Card title="能力评分">
+              <svg viewBox="0 0 440 340" style={{ width: '100%', maxHeight: 340 }} role="img" aria-label="面试能力雷达图">
+                {[20,40,60,80,100].map(level => <polygon key={level} points={report.scoreItems.map((_, i) => { const angle = i * Math.PI * 2 / report.scoreItems.length - Math.PI / 2; return `${220 + Math.cos(angle)*level*1.1},${165 + Math.sin(angle)*level*1.1}`; }).join(' ')} fill="#f4f1ff" stroke="#ded8ef" />)}
+                <polygon points={report.scoreItems.map((item, i) => { const angle = i*Math.PI*2/report.scoreItems.length-Math.PI/2; return `${220+Math.cos(angle)*item.score*1.1},${165+Math.sin(angle)*item.score*1.1}`; }).join(' ')} fill="#8274ec55" stroke="#8274ec" strokeWidth="3" />
+                {report.scoreItems.map((item,i) => { const angle=i*Math.PI*2/report.scoreItems.length-Math.PI/2; return <text key={item.key} x={220+Math.cos(angle)*145} y={165+Math.sin(angle)*145} textAnchor="middle" fontSize="13"><title>{item.comment}</title>{item.label} {item.score}</text>; })}
+              </svg>
               <div className="interview-score-grid">
                 {report.scoreItems.map((item) => (
                   <div className="interview-score-item" key={item.key}>
                     <Progress type="circle" size={76} percent={item.score} strokeColor="#347565" />
-                    <strong>{item.label}</strong><span>{item.comment}</span>
+                    <Tooltip title={`评分依据：${({ fundamentals: '知识准确性、原理理解与边界条件', framework: '框架原理、实际应用和方案取舍', engineering: '工程实践、性能优化与可维护性', communication: '回答相关性、清晰度、结构和完整性；转写无法可靠判断语速或自信程度', problem_solving: '问题拆解、解决步骤、验证和结果' })[item.key]}。本次表现：${item.comment}`}><strong tabIndex={0}>{item.label} ⓘ</strong></Tooltip><span>{item.comment}</span>
                   </div>
                 ))}
               </div>
             </Card>
-            <Card title="问答回顾与逐题点评" extra={<Tag>{report.qaReviews.length} 轮有效回答</Tag>}>
-              {report.qaReviews.length ? (
-                <List
-                  dataSource={report.qaReviews}
-                  renderItem={(item, index) => (
-                    <List.Item>
-                      <div className="interview-qa-review">
-                        <div><Tag color="green">{item.score} 分</Tag><strong>Q{index + 1}：{item.question}</strong></div>
-                        <p><b>回答：</b>{item.answer}</p>
-                        <p><b>点评：</b>{item.feedback}</p>
-                      </div>
-                    </List.Item>
-                  )}
-                />
-              ) : <Empty description="未获得有效语音转写，暂时无法生成逐题点评" />}
+            <Card title="问题回顾">
+              <Tabs destroyOnHidden items={Array.from(new Set(clips.map(clip => clip.main))).map(main => ({
+                key: String(main), label: main === 9 ? '反问环节' : `问题${main}`,
+                children: clips.filter(clip => clip.main === main).map((clip, index) => {
+                  const review = report.qaReviews.find(item => item.question === clip.question);
+                  return <div key={clip.url}>
+                    <Typography.Title level={5}>{clip.question}</Typography.Title>
+                    <video controls preload="metadata" src={clip.url} style={{ width: '100%', maxHeight: 320 }} />
+                    <Button href={clip.url} download={`answer-${main}-${index}.webm`}>下载本段回答</Button>
+                    <p><b>你的回答：</b>{review?.answer || '未获得与本题匹配的有效转写'}</p>
+                    {review ? <><p><b>考察点：</b>{review.assessment}</p><p><b>优缺点分析：</b>{review.feedback}</p><p><b>AI 推荐回答：</b>{review.sampleAnswer || 'AI 推荐回答暂未生成，请稍后重试'}</p></> : <p>本题 AI 推荐回答暂未生成。</p>}
+                  </div>;
+                }),
+              }))} />
+              {!clips.length && <Tabs items={report.qaReviews.map((item,index) => ({ key: String(index), label: `问题${index+1}`, children: <div><h3>{item.question}</h3><p>你的回答：{item.answer}</p><p>考察点：{item.assessment}</p><p>分析：{item.feedback}</p><p>AI 推荐回答：{item.sampleAnswer}</p></div> }))} />}
+              <p>录像与面试记录保存三天，到期自动清理。</p>
             </Card>
             <div className="interview-report-columns">
               <Card title="表现亮点"><List dataSource={report.strengths} renderItem={(item) => <List.Item>{item}</List.Item>} /></Card>
@@ -332,6 +460,13 @@ export function InterviewPage() {
     );
   }
 
+  if (showHistory) {
+    return <div className="page-container interview-page">
+      <PageHeader title="面试记录" description="查看近三天的面试报告和逐题录像，到期自动清理。" action={<Button onClick={() => navigate('/interview')}>返回面试入口</Button>} />
+      <Card title="面试记录（保留三天）"><List loading={history.isLoading} dataSource={history.data ?? []} locale={{ emptyText: '暂无面试记录' }} renderItem={item => <List.Item actions={[<Button key="view" disabled={!item.report} onClick={async () => { try { const saved = await Promise.all((item.clips ?? []).map(async clip => ({ ...clip, answer: '', url: await loadInterviewClip(item.id, clip.id) }))); setReport(item.report); setClips(saved); setPhase('ended'); } catch { message.error('录像加载失败，请重试'); } }}>查看报告</Button>]}><List.Item.Meta title={new Date(item.created_at).toLocaleString()} description={item.status === 'completed' ? '报告已生成' : item.status === 'failed' ? '报告生成失败' : '报告生成中'} /></List.Item>} /></Card>
+    </div>;
+  }
+
   if (phase === 'active') {
     return (
       <div className="interview-room">
@@ -340,7 +475,7 @@ export function InterviewPage() {
             <Tag color={phase === 'active' ? 'green' : 'default'}>
               {phase === 'active' ? '面试进行中' : '面试已结束'}
             </Tag>
-            <strong>前端模拟面试</strong>
+            <strong>前端模拟面试 · {reverseRef.current ? '反问环节' : `第 ${roundRef.current} 题 / 共 8 题`}</strong>
           </div>
           <Space>
             <ClockCircleOutlined />
@@ -360,22 +495,22 @@ export function InterviewPage() {
                   })
                 }
               >
-                结束面试
+                完成面试
               </Button>
           </Space>
         </header>
         <div className="interview-room-grid">
-          <Card className={`interviewer-stage${session?.enableAvatar ? "" : " voice-interview-stage"}`}>
+          <Card className={`interviewer-stage${session?.enableAvatar ? "" : " voice-interview-stage"}${waitingForQuestion ? ' interview-thinking' : ''}`}>
             {session?.enableAvatar ? (
               <div ref={avatarContainerRef} className="avatar-video-canvas" />
             ) : (
               <div className="voice-interviewer-portrait-panel">
-                <p className="interview-stage-hint">{answerPhase === 'answering' ? '正在录音，每题最多作答 3 分钟。' : answerPhase === 'finished' ? '麦克风已关闭，点击“下一题”继续面试。' : '准备阶段不录音、不记录回答；30 秒后自动开始，也可点击“我准备好了”提前作答。'}</p>
+                <p className="interview-stage-hint">{waitingForQuestion ? '面试官正在思考下一题，请稍候…' : interviewQuestionsFinished ? '题库问题已完成，可以完成面试。' : answerPhase === 'answering' ? '正在录音，每题最多作答 3 分钟。' : answerPhase === 'finished' ? '麦克风已关闭，可继续下一题或结束面试生成报告。' : '准备阶段不录音；30 秒后自动进入作答并录制，也可点击“我准备好了”提前开始。'}</p>
                 <img className="voice-interviewer-portrait" src="/images/interviewer.png" alt="AI 面试官" />
                 <strong>面试官</strong>
                 <div className="interview-stage-countdown" aria-live="polite">
                 <Tag color={answerPhase === 'answering' ? 'green' : 'default'}>
-                  {answerPhase === 'preparing' ? `思考时间 ${remainingSeconds}s` : answerPhase === 'answering' ? `作答剩余 ${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, '0')}` : answerPhase === 'finished' ? '本题作答已结束' : '等待面试官提问'}
+                  {waitingForQuestion ? <><Spin size="small" /> 面试官思考中</> : interviewQuestionsFinished ? '问题已问完' : answerPhase === 'preparing' ? `思考时间 ${remainingSeconds}s` : answerPhase === 'answering' ? `作答剩余 ${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, '0')}` : answerPhase === 'finished' ? '本题作答已结束' : '等待面试官提问'}
                 </Tag>
 
                 </div>
@@ -418,20 +553,23 @@ export function InterviewPage() {
               <Space className="interview-voice-controls" wrap>
                 {answerPhase === 'answering' && <Button type="primary" onClick={async () => {
                   try {
+                    await stopClip();
                     await rtcRef.current.setAnswering(false);
                     setAnswerPhase('finished');
                     setQuestionDeadline(0);
+                    if (reverseRef.current) await stopInterview.mutateAsync();
                   } catch { message.error('关闭麦克风失败，请重试'); }
                 }}>回答完毕</Button>}
-                {answerPhase === 'finished' && <Button
+                {answerPhase === 'finished' && !interviewQuestionsFinished && <Button
                   type="primary"
                   icon={<ForwardOutlined />}
                   loading={controlInterview.isPending && controlInterview.variables === 'next'}
-                  disabled={controlInterview.isPending}
+                  disabled={controlInterview.isPending || controlInFlightRef.current}
                   onClick={() => controlInterview.mutate('next')}
                 >
                   下一题
                 </Button>}
+                {interviewQuestionsFinished && <Button type="primary" danger icon={<PoweroffOutlined />} loading={stopInterview.isPending} onClick={() => stopInterview.mutate()}>完成面试</Button>}
               </Space>
             ) : null}
             {!transcriptionEnabled && (mediaReady || !session?.enableAvatar) ? (
@@ -441,8 +579,16 @@ export function InterviewPage() {
                 message="当前浏览器不支持语音转写，结束后将无法生成逐题问答报告"
               />
             ) : null}
+            {waitingForQuestion && (
+              <div className="interview-thinking-overlay" role="status" aria-live="polite">
+                <Spin size="large" />
+                <strong>面试官正在准备下一轮问题</strong>
+                <span>正在结合本轮回答思考，请稍候…</span>
+              </div>
+            )}
           </Card>
           <aside className="interview-side-panel">
+            <Card title={answerPhase === 'answering' ? "摄像头 · 本题录制中" : "摄像头 · 预览（未录制）"}><video autoPlay muted playsInline ref={attachCameraPreview} style={{ width: '100%', aspectRatio: '4 / 3', objectFit: 'cover', background: '#172923', borderRadius: 12 }} /></Card>
             <Card title="本场设置">
               <div className="interview-facts">
                 <span>方向<strong>{session?.track === 'react' ? 'React' : session?.track === 'vue' ? 'Vue' : '泛前端'}</strong></span>
@@ -484,6 +630,8 @@ export function InterviewPage() {
           description="请在后端 .env 中配置火山引擎 AK/SK 和 RTC AppId/AppKey。"
         />
       ) : null}
+      <Button onClick={() => navigate('/interview/history')}>面试记录</Button>
+
       <div className="interview-setup-grid">
         <Card className="surface-card interview-setup-card" title="配置本次面试">
           <Form<SetupValues>
@@ -530,7 +678,7 @@ export function InterviewPage() {
               loading={startInterview.isPending || phase === 'connecting'}
               disabled={!readiness.data?.configured}
             >
-              {phase === 'connecting' ? '正在进入面试房间' : '检查麦克风并开始面试'}
+              {phase === 'connecting' ? '正在进入面试房间' : '开启摄像头并开始面试'}
             </Button>
           </Form>
         </Card>
@@ -546,7 +694,7 @@ export function InterviewPage() {
           <Card title="开始前确认">
             <ul className="interview-checklist">
               <li><CheckCircleFilled /> 使用耳机可以减少回声</li>
-              <li><CheckCircleFilled /> 浏览器将请求麦克风权限</li>
+              <li><CheckCircleFilled /> 浏览器将请求摄像头与麦克风权限，结束后请下载录像</li>
               <li><CheckCircleFilled /> 面试过程中不会展示参考答案</li>
               <li><AudioOutlined /> 支持自然停顿和语音打断</li>
             </ul>

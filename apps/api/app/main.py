@@ -13,7 +13,17 @@ from app.infrastructure.db.session import SessionDep
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
+    import asyncio
+    from app.modules.interview.api import cleanup_interview_history
+    async def cleanup():
+        while True:
+            await asyncio.to_thread(cleanup_interview_history)
+            await asyncio.sleep(3600)
+    task = asyncio.create_task(cleanup())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 settings = get_settings()

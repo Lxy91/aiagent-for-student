@@ -1222,6 +1222,22 @@ button {
 .interview-voice-controls {
   margin-top: 16px;
 }
+.interview-thinking { position: relative; overflow: hidden; }
+.interview-thinking-overlay {
+  position: absolute;
+  z-index: 5;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: #285f52;
+  background: rgb(239 246 241 / 82%);
+  backdrop-filter: blur(5px);
+}
+.interview-thinking-overlay strong { font-size: 20px; }
+.interview-thinking-overlay span { color: #68756f; }
 .avatar-video-canvas video,
 .avatar-video-canvas canvas {
   display: block;

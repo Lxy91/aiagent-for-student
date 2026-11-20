@@ -197,7 +197,7 @@ class InterviewService:
         if session.report is not None:
             return session.report
 
-        answers = [item for item in payload.answers if item.text.strip()]
+        answers = [item for item in payload.answers if item.text.strip() or item.question.strip()]
         if not self.settings.deepseek_enabled or not answers:
             report = self._fallback_report(session_id, answers)
         else:
@@ -209,12 +209,14 @@ class InterviewService:
                             "role": "system",
                             "content": (
                                 "你是资深前端面试官。根据面试配置和候选人的浏览器语音转写生成严格的JSON面试报告。"
-                                "由于数字人SDK未返回面试官字幕，question必须根据回答内容谨慎还原，并在问题末尾标注"
-                                "‘（根据回答还原）’。不要虚构回答中没有出现的技术细节。评分范围0到100。"
+                                "每个输入条目生成一项qa_reviews。输入有question时必须原样返回question用于关联，禁止改写。"
+                                "没有question时才根据回答谨慎还原问题。没有回答时明确标注未获得转写，但仍给出该问题的推荐回答。"
+                                "自我介绍、项目经历等推荐回答应基于用户已有回答润色，保留真实事实，不编造姓名、学历、经历和量化成绩。"
+                                "缺少个人信息时用明确占位符；技术题提供具体完整可直接参考的答案。评分范围0到100。"
                                 "必须返回overall_score、summary、score_items、qa_reviews、strengths、improvements、next_steps。"
                                 "score_items必须恰好包含fundamentals/前端基础、framework/框架能力、"
                                 "engineering/工程化、communication/表达沟通、problem_solving/问题分析五项，"
-                                "每项包含key、label、score、comment。qa_reviews每项包含question、answer、score、feedback。"
+                                "每项包含key、label、score、comment。qa_reviews每项包含question、answer、score、feedback、assessment（考察点）、sample_answer（完整可参考的示例回答，不要仅给建议）。feedback明确优点、不足与改进方法。仅依据转写评价，不推断真实自信度、眼神或语速。"
                             ),
                         },
                         {

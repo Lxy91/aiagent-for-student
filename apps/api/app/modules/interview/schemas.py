@@ -41,7 +41,8 @@ class InterviewReadinessResponse(BaseModel):
 
 
 class InterviewTranscriptEntry(BaseModel):
-    text: str = Field(min_length=1, max_length=2000)
+    question: str = Field(default="", max_length=4000)
+    text: str = Field(max_length=2000)
     recorded_at_seconds: int = Field(default=0, ge=0, le=7200)
 
 
@@ -61,6 +62,8 @@ class InterviewQaReview(BaseModel):
     answer: str
     score: int = Field(ge=0, le=100)
     feedback: str
+    assessment: str = ""
+    sample_answer: str = ""
 
 
 class InterviewReportResponse(BaseModel):

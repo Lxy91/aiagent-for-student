@@ -210,6 +210,8 @@ function toInterviewReport(item: Record<string, unknown>): InterviewReport {
       answer: String(qa.answer),
       score: Number(qa.score),
       feedback: String(qa.feedback),
+      assessment: String(qa.assessment ?? ""),
+      sampleAnswer: String(qa.sample_answer ?? ""),
     })),
     strengths: (item.strengths as string[]) ?? [],
     improvements: (item.improvements as string[]) ?? [],
@@ -269,6 +271,7 @@ export const apiClient = {
           answers: answers.map((answer) => ({
             text: answer.text,
             recorded_at_seconds: answer.recordedAtSeconds,
+            question: answer.question,
           })),
         }),
       }),
@@ -857,3 +860,26 @@ export const apiClient = {
     };
   },
 };
+
+
+export function logInterviewDiagnostic(sessionId: string, event: string, requestId = '', elapsedMs = 0, detail = '') {
+  void request('/interviews/diagnostics', { method: 'POST', body: JSON.stringify({ session_id: sessionId, event, request_id: requestId, elapsed_ms: Math.round(elapsedMs), detail }) }).catch(() => undefined);
+}
+
+export async function completeInterview(id: string, answers: InterviewTranscriptEntry[]) {
+  return request(`/interviews/sessions/${id}:complete`, { method: 'POST', body: JSON.stringify({ answers: answers.map(answer => ({ text: answer.text, question: answer.question, recorded_at_seconds: answer.recordedAtSeconds })) }) });
+}
+export async function getInterviewHistory() {
+  const records = await request<Array<{ id: string; created_at: string; status: string; clips?: Array<{id: string; question: string; main: number; followUp: boolean}>; report: Record<string, unknown> | null }>>('/interviews/history');
+  return records.map(record => ({ ...record, report: record.report ? toInterviewReport(record.report) : undefined }));
+}
+
+export async function uploadInterviewClip(id: string, clip: {url: string; question: string; main: number; followUp: boolean}) {
+  const body = new FormData();
+  body.append('video', await (await fetch(clip.url)).blob(), 'answer.webm');
+  body.append('question', clip.question); body.append('main', String(clip.main)); body.append('follow_up', String(clip.followUp));
+  await request(`/interviews/sessions/${id}/clips`, { method: 'POST', body });
+}
+export async function loadInterviewClip(id: string, clipId: string) {
+  return URL.createObjectURL(await request<Blob>(`/interviews/history/${id}/clips/${clipId}`, {}, true, 'blob'));
+}

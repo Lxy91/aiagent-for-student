@@ -180,6 +180,7 @@ export function App() {
         <Route index element={<Navigate to="/chat" replace />} />
         <Route path="chat" element={<ChatPage />} />
         <Route path="interview" element={<InterviewPage />} />
+        <Route path="interview/history" element={<InterviewPage />} />
         <Route path="plans" element={<PlansPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="knowledge" element={<KnowledgePage />} />
